@@ -1,0 +1,6 @@
+node_modules/
+downloads/
+.mcro-puller/
+.DS_Store
+*.tmp
+*.log

@@ -1,0 +1,437 @@
+[
+  {
+    "id": "cty-173",
+    "code": "173",
+    "name": "Aitkin"
+  },
+  {
+    "id": "cty-190",
+    "code": "190",
+    "name": "Anoka"
+  },
+  {
+    "id": "cty-150",
+    "code": "150",
+    "name": "Becker"
+  },
+  {
+    "id": "cty-174",
+    "code": "174",
+    "name": "Beltrami"
+  },
+  {
+    "id": "cty-151",
+    "code": "151",
+    "name": "Benton"
+  },
+  {
+    "id": "cty-160",
+    "code": "160",
+    "name": "Big Stone"
+  },
+  {
+    "id": "cty-131",
+    "code": "131",
+    "name": "Blue Earth"
+  },
+  {
+    "id": "cty-132",
+    "code": "132",
+    "name": "Brown"
+  },
+  {
+    "id": "cty-146",
+    "code": "146",
+    "name": "Carlton"
+  },
+  {
+    "id": "cty-111",
+    "code": "111",
+    "name": "Carver"
+  },
+  {
+    "id": "cty-175",
+    "code": "175",
+    "name": "Cass"
+  },
+  {
+    "id": "cty-161",
+    "code": "161",
+    "name": "Chippewa"
+  },
+  {
+    "id": "cty-191",
+    "code": "191",
+    "name": "Chisago"
+  },
+  {
+    "id": "cty-152",
+    "code": "152",
+    "name": "Clay"
+  },
+  {
+    "id": "cty-176",
+    "code": "176",
+    "name": "Clearwater"
+  },
+  {
+    "id": "cty-147",
+    "code": "147",
+    "name": "Cook"
+  },
+  {
+    "id": "cty-133",
+    "code": "133",
+    "name": "Cottonwood"
+  },
+  {
+    "id": "cty-177",
+    "code": "177",
+    "name": "Crow Wing"
+  },
+  {
+    "id": "cty-112",
+    "code": "112",
+    "name": "Dakota"
+  },
+  {
+    "id": "cty-119",
+    "code": "119",
+    "name": "Dodge"
+  },
+  {
+    "id": "cty-153",
+    "code": "153",
+    "name": "Douglas"
+  },
+  {
+    "id": "cty-134",
+    "code": "134",
+    "name": "Faribault"
+  },
+  {
+    "id": "cty-120",
+    "code": "120",
+    "name": "Fillmore"
+  },
+  {
+    "id": "cty-121",
+    "code": "121",
+    "name": "Freeborn"
+  },
+  {
+    "id": "cty-113",
+    "code": "113",
+    "name": "Goodhue"
+  },
+  {
+    "id": "cty-162",
+    "code": "162",
+    "name": "Grant"
+  },
+  {
+    "id": "cty-130",
+    "code": "130",
+    "name": "Hennepin"
+  },
+  {
+    "id": "cty-122",
+    "code": "122",
+    "name": "Houston"
+  },
+  {
+    "id": "cty-178",
+    "code": "178",
+    "name": "Hubbard"
+  },
+  {
+    "id": "cty-192",
+    "code": "192",
+    "name": "Isanti"
+  },
+  {
+    "id": "cty-179",
+    "code": "179",
+    "name": "Itasca"
+  },
+  {
+    "id": "cty-135",
+    "code": "135",
+    "name": "Jackson"
+  },
+  {
+    "id": "cty-193",
+    "code": "193",
+    "name": "Kanabec"
+  },
+  {
+    "id": "cty-163",
+    "code": "163",
+    "name": "Kandiyohi"
+  },
+  {
+    "id": "cty-180",
+    "code": "180",
+    "name": "Kittson"
+  },
+  {
+    "id": "cty-181",
+    "code": "181",
+    "name": "Koochiching"
+  },
+  {
+    "id": "cty-164",
+    "code": "164",
+    "name": "Lac Qui Parle"
+  },
+  {
+    "id": "cty-148",
+    "code": "148",
+    "name": "Lake"
+  },
+  {
+    "id": "cty-182",
+    "code": "182",
+    "name": "Lake of the Woods"
+  },
+  {
+    "id": "cty-114",
+    "code": "114",
+    "name": "LeSueur"
+  },
+  {
+    "id": "cty-136",
+    "code": "136",
+    "name": "Lincoln"
+  },
+  {
+    "id": "cty-137",
+    "code": "137",
+    "name": "Lyon"
+  },
+  {
+    "id": "cty-183",
+    "code": "183",
+    "name": "Mahnomen"
+  },
+  {
+    "id": "cty-184",
+    "code": "184",
+    "name": "Marshall"
+  },
+  {
+    "id": "cty-138",
+    "code": "138",
+    "name": "Martin"
+  },
+  {
+    "id": "cty-115",
+    "code": "115",
+    "name": "McLeod"
+  },
+  {
+    "id": "cty-165",
+    "code": "165",
+    "name": "Meeker"
+  },
+  {
+    "id": "cty-154",
+    "code": "154",
+    "name": "Mille Lacs"
+  },
+  {
+    "id": "cty-155",
+    "code": "155",
+    "name": "Morrison"
+  },
+  {
+    "id": "cty-123",
+    "code": "123",
+    "name": "Mower"
+  },
+  {
+    "id": "cty-139",
+    "code": "139",
+    "name": "Murray"
+  },
+  {
+    "id": "cty-140",
+    "code": "140",
+    "name": "Nicollet"
+  },
+  {
+    "id": "cty-141",
+    "code": "141",
+    "name": "Nobles"
+  },
+  {
+    "id": "cty-185",
+    "code": "185",
+    "name": "Norman"
+  },
+  {
+    "id": "cty-124",
+    "code": "124",
+    "name": "Olmsted"
+  },
+  {
+    "id": "cty-156",
+    "code": "156",
+    "name": "Otter Tail"
+  },
+  {
+    "id": "cty-186",
+    "code": "186",
+    "name": "Pennington"
+  },
+  {
+    "id": "cty-194",
+    "code": "194",
+    "name": "Pine"
+  },
+  {
+    "id": "cty-142",
+    "code": "142",
+    "name": "Pipestone"
+  },
+  {
+    "id": "cty-187",
+    "code": "187",
+    "name": "Polk"
+  },
+  {
+    "id": "cty-166",
+    "code": "166",
+    "name": "Pope"
+  },
+  {
+    "id": "cty-118",
+    "code": "118",
+    "name": "Ramsey"
+  },
+  {
+    "id": "cty-188",
+    "code": "188",
+    "name": "Red Lake"
+  },
+  {
+    "id": "cty-143",
+    "code": "143",
+    "name": "Redwood"
+  },
+  {
+    "id": "cty-167",
+    "code": "167",
+    "name": "Renville"
+  },
+  {
+    "id": "cty-125",
+    "code": "125",
+    "name": "Rice"
+  },
+  {
+    "id": "cty-144",
+    "code": "144",
+    "name": "Rock"
+  },
+  {
+    "id": "cty-189",
+    "code": "189",
+    "name": "Roseau"
+  },
+  {
+    "id": "cty-116",
+    "code": "116",
+    "name": "Scott"
+  },
+  {
+    "id": "cty-195",
+    "code": "195",
+    "name": "Sherburne"
+  },
+  {
+    "id": "cty-117",
+    "code": "117",
+    "name": "Sibley"
+  },
+  {
+    "id": "cty-149",
+    "code": "149",
+    "name": "St. Louis"
+  },
+  {
+    "id": "cty-157",
+    "code": "157",
+    "name": "Stearns"
+  },
+  {
+    "id": "cty-126",
+    "code": "126",
+    "name": "Steele"
+  },
+  {
+    "id": "cty-168",
+    "code": "168",
+    "name": "Stevens"
+  },
+  {
+    "id": "cty-169",
+    "code": "169",
+    "name": "Swift"
+  },
+  {
+    "id": "cty-158",
+    "code": "158",
+    "name": "Todd"
+  },
+  {
+    "id": "cty-170",
+    "code": "170",
+    "name": "Traverse"
+  },
+  {
+    "id": "cty-127",
+    "code": "127",
+    "name": "Wabasha"
+  },
+  {
+    "id": "cty-159",
+    "code": "159",
+    "name": "Wadena"
+  },
+  {
+    "id": "cty-128",
+    "code": "128",
+    "name": "Waseca"
+  },
+  {
+    "id": "cty-196",
+    "code": "196",
+    "name": "Washington"
+  },
+  {
+    "id": "cty-145",
+    "code": "145",
+    "name": "Watonwan"
+  },
+  {
+    "id": "cty-171",
+    "code": "171",
+    "name": "Wilkin"
+  },
+  {
+    "id": "cty-129",
+    "code": "129",
+    "name": "Winona"
+  },
+  {
+    "id": "cty-197",
+    "code": "197",
+    "name": "Wright"
+  },
+  {
+    "id": "cty-172",
+    "code": "172",
+    "name": "Yellow Medicine"
+  }
+]

@@ -1,0 +1,36 @@
+{
+  "name": "MCRO-Puller",
+  "version": "1.0.0",
+  "description": "Autonomous Minnesota Court Records Online (MCRO) WAF-safe document puller",
+  "main": "cli.js",
+  "bin": {
+    "mcro": "./cli.js"
+  },
+  "scripts": {
+    "start": "node cli.js",
+    "search": "node cli.js search",
+    "download": "node cli.js download-case",
+    "crawl": "node cli.js crawl",
+    "verify": "node cli.js verify",
+    "status": "node cli.js status"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.18.0",
+      "onFail": "download"
+    }
+  },
+  "packageManager": "pnpm@12.18.0",
+  "type": "module",
+  "dependencies": {
+    "commander": "^15.1.0",
+    "playwright": "^1.65.0",
+    "playwright-extra": "^4.3.6",
+    "playwriter": "^0.11.0",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
