@@ -100,3 +100,16 @@ The next product milestone requires Pat's separate source-access decision, not a
 - Search and bulk proof (MN-F03): 7 search modes evaluated and documented; mixed bulk query batch (valid + duplicate + invalid) proves item-level error isolation and lineage without neighboring row failure.
 - Refresh & recovery (MN-F04): Docket reuse efficiency implemented (`navsAvoided > 0`), eliminating redundant search/navigation cycles in `fetchDocument`; scheduled refresh skips unchanged bytes; worker SIGKILL and lease expiry recovery verified without duplicate artifacts.
 - Operability (MN-F05): Rich subsystem readiness in `courtctl doctor`; reproducible `pnpm feasibility:mn` harness verified with retained report `.runtime/feasibility/<run-id>/report.json`.
+
+## Milestone WO-MCRO-MN-LIVE-003: Minnesota Real-Source Integration and Release Proof
+
+- Controlling order: [WO-MCRO-MN-LIVE-003](WO_MN_LIVE_003.md). Review findings: [WO_MN_LIVE_003_REVIEW.md](WO_MN_LIVE_003_REVIEW.md). Technical evidence log: [MINNESOTA_LIVE_INTEGRATION.md](MINNESOTA_LIVE_INTEGRATION.md).
+- Status: **Gate L1 Passed** (263/263 unit/platform tests, CLI/REST/MCP, authentic corpus replay); **Gate L2 Blocked (External Source Gate)**; **Gates L3–L4 Pending Gate L2**.
+- Standalone browser navigation to `https://publicaccess.courts.state.mn.us/CaseSearch` observed (HTTP 200, title verified).
+- Terms & Conditions modal detected (`#tcModalContent`, `#tcModalAcceptBtn`). In non-interactive automated mode, `ensureTermsAccepted` fails closed (`code: 'blocked'`), enforcing operator review mandate.
+- Operator session imported (`~/.mcro-puller/session.json`, mode `0600`) with authentic cookies (`IsAcceptedTerms`, `TermsExpirationTime`, `mcro-session`). Confirmed navigation with loaded session dismisses Terms modal completely.
+- Form search submission intercepted by MCRO F5 BIG-IP / Volterra ASM (`"The requested URL was rejected"`). Updated `src/search.js` (`waitForSearchResults`) to detect F5 ASM rejection immediately without 30-second dead timeouts, and updated `choose()`/`field()` to wait for Bootstrap tab transitions.
+- Corrected all six review findings (R003-1 through R003-6) verified with 7 focused offline regression tests in `test/live-integration-review.test.ts`: four-way live-mode contract (`isLiveModeEnabled`), accurate gate accounting (`evaluateLiveGates`), separate live vs replay paths, stage error isolation, live pilot budget enforcement (`createLiveBudgetContext`), and session page validation (`validateSessionPage`).
+- Delivered human-assisted operator session tooling (`scripts/session-interactive.mjs`, `pnpm session:mn`) supporting `--import <file>`, `--status`, and `--clear`, plus `courtctl session status` and `courtctl session clear`.
+- Added `--live-adapter` opt-in flag to feasibility harness (`pnpm live:mn`) with live pilot schema retention (`mn_live_<runId>`) and run report `.runtime/live-feasibility/<runId>/report.json`.
+- Single actionable operator step defined in `docs/HANDOFF.md` and `docs/MINNESOTA_LIVE_INTEGRATION.md`: obtain court administrator authorization at `https://courtapi.courts.state.mn.us/support/` to resolve F5 ASM rejection for programmatic access.

@@ -1,4 +1,4 @@
-import { CONFIG } from './config.js';
+import { CONFIG, MAX_PULL_CONCURRENCY } from './config.js';
 import { createBrowserClient } from './browser.js';
 import { crawlCase } from './crawler.js';
 import { safeCaseNumber } from './downloader.js';
@@ -7,9 +7,11 @@ import { sleepJitter } from './waf.js';
 
 export class WorkerQueue {
   constructor(options = {}) {
-    // This legacy queue has one source. Never overlap requests or rotate identities
-    // after a challenge; distributed multi-source concurrency belongs to platform jobs.
-    this.concurrency = 1;
+    // Operator-approved concurrency: up to 10 concurrent pull jobs (hard
+    // ceiling). Each worker is sticky-assigned one proxy from the pool by
+    // index; an empty pool means direct connections.
+    this.concurrency = Math.max(1, Math.min(options.concurrency ?? CONFIG.concurrency, MAX_PULL_CONCURRENCY));
+    this.proxyPool = options.proxyPool || CONFIG.proxyPool;
     this.mode = options.mode || 'extension';
     this.headed = options.headed || false;
     this.outputDir = options.outputDir || CONFIG.outputDir;
@@ -65,7 +67,7 @@ export class WorkerQueue {
     this.status = this.isStopping ? this.status : 'running';
     try {
       await this.persist();
-      await this.spawnWorker(1);
+      await Promise.all(Array.from({ length: this.concurrency }, (_, index) => this.spawnWorker(index + 1)));
       if (!this.isStopping) this.status = this.failedCount ? 'partial' : 'complete';
       await this.persist();
       return { succeeded: this.completedCount, failed: this.failedCount, stopped: this.isStopping,
@@ -77,6 +79,9 @@ export class WorkerQueue {
   }
 
   async spawnWorker(workerId) {
+    // Sticky proxy: worker N always egresses through pool[N-1] (mod pool
+    // size) so F5/session cookies stay bound to one exit IP per worker.
+    const proxy = this.proxyPool.length ? this.proxyPool[(workerId - 1) % this.proxyPool.length] : undefined;
     while (this.queue.length && !this.isStopping) {
       const caseNumber = this.queue.shift();
       this.inFlight.push(caseNumber);
@@ -84,7 +89,7 @@ export class WorkerQueue {
       await this.persist();
       let client;
       try {
-        client = await this.createClient({ mode: this.mode, headed: this.headed });
+        client = await this.createClient({ mode: this.mode, headed: this.headed, proxy });
         if (this.isStopping) {
           this.retryCases.push(caseNumber);
           continue;

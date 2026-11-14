@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { createReadStream } from 'node:fs';
-import { extname } from 'node:path';
+import { createReadStream, existsSync, readFileSync, unlinkSync, statSync } from 'node:fs';
+import path, { extname } from 'node:path';
+import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { parse } from 'csv-parse/sync';
@@ -8,6 +9,7 @@ import { z } from 'zod';
 import { createApplication } from './bootstrap.js';
 import { createDatabase, migrate } from './database.js';
 import { bulkSchema, invokeOperation, MAX_BODY_BYTES, type InterfaceService } from './interfaces.js';
+import { CONFIG } from '../config.js';
 
 export const HELP = `courtctl — local trusted court evidence interface (JSON output)
   sources list
@@ -32,6 +34,7 @@ export const HELP = `courtctl — local trusted court evidence interface (JSON o
   coverage [--source SOURCE] [--state STATE] [--court COURT] [--county COUNTY]
     [--category CATEGORY] [--filed-from DATE --filed-to DATE] [--limit N --offset N]
   discovery plan --query JSON | schedule due
+  session status | session clear
   doctor | storage verify | metrics | import-legacy --directory PATH
 Search query JSON supports case, party, business, attorney, hearing, judgment and
  document modes; source caps reports actual requirements and evidence levels.
@@ -99,6 +102,28 @@ export async function migrateDatabase(): Promise<unknown> {
   const pool = createDatabase(url);
   try { await migrate(pool); return { migrated: true }; }
   finally { await pool.end(); }
+}
+
+export function handleSessionCommand(action: string): unknown {
+  const sessionFile = process.env.COURT_SESSION_FILE || CONFIG.sessionFile || path.join(os.homedir(), '.mcro-puller', 'session.json');
+  if (action === 'clear') {
+    if (existsSync(sessionFile)) { unlinkSync(sessionFile); return { cleared: true, path: sessionFile }; }
+    return { cleared: false, path: sessionFile, reason: 'File does not exist' };
+  }
+  if (!existsSync(sessionFile)) return { exists: false, path: sessionFile };
+  const stat = statSync(sessionFile);
+  const modeOctal = (stat.mode & 0o777).toString(8).padStart(4, '0');
+  const content = JSON.parse(readFileSync(sessionFile, 'utf8'));
+  const cookies = Array.isArray(content.cookies) ? content.cookies : [];
+  return {
+    exists: true,
+    path: sessionFile,
+    mode: modeOctal,
+    sizeBytes: stat.size,
+    updatedAt: stat.mtime.toISOString(),
+    cookieCount: cookies.length,
+    cookies: cookies.map((c: any) => ({ name: c.name, domain: c.domain, expires: c.expires > 0 ? new Date(c.expires * 1000).toISOString() : 'session' })),
+  };
 }
 
 export async function runCli(args: string[], service: InterfaceService): Promise<unknown> {
@@ -183,6 +208,10 @@ export async function runCli(args: string[], service: InterfaceService): Promise
   else if(command==='retention'&&action==='request'){operation='request_retention';input={...z.record(z.string(),z.unknown()).parse(JSON.parse(required('query'))),idempotencyKey:required('idempotency-key')};}
   else if(command==='retention'&&['status','run'].includes(action??'')){expectedPositionals=3;operation=action==='status'?'get_retention_request':'run_retention';input={id,...(action==='run'?{idempotencyKey:required('idempotency-key')}:{})};}
   else if(command==='case'&&['interpretation','interpret'].includes(action??'')){expectedPositionals=3;operation=action==='interpretation'?'get_case_interpretation':'request_case_interpretation';input={id,...(action==='interpret'?{idempotencyKey:required('idempotency-key')}:{})};}
+  else if (command === 'session' && ['status', 'clear'].includes(action ?? '')) {
+    expectedPositionals = 2;
+    return handleSessionCommand(action!);
+  }
   else if (command === 'doctor') { expectedPositionals = 1; operation = 'health'; }
   else if (command === 'storage' && action === 'verify') operation = 'verify_storage';
   else if (command === 'metrics') { expectedPositionals = 1; operation = 'metrics'; }
@@ -197,6 +226,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (!args.length || args.includes('--help') || args[0] === 'help') { process.stdout.write(HELP); return; }
   if (args.length === 2 && args[0] === 'db' && args[1] === 'migrate') {
     process.stdout.write(`${JSON.stringify(await migrateDatabase())}\n`); return;
+  }
+  const action = args[1];
+  if (args.length === 2 && args[0] === 'session' && action && ['status', 'clear'].includes(action)) {
+    process.stdout.write(`${JSON.stringify(handleSessionCommand(action))}\n`); return;
   }
   const application = await createApplication();
   try { process.stdout.write(`${JSON.stringify(await runCli(args, application.service))}\n`); }

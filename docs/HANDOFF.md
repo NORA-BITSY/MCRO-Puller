@@ -8,11 +8,11 @@ Controlling release boundary: [WO-MCRO-MN-FIRST-001](WO_MN_FIRST_001.md) and [WO
 
 - Repository: `/Users/pat/Projects/MCRO-Puller`; branch `refactor/wo-mcro-national-001`.
 - Original source/test checkpoint `bb88e80` preserved. Application implementation: `819b512`; host-database restart correction: `e5a1140`. Feasibility milestone: `WO-MCRO-MN-FEASIBILITY-002`. No remote push/publication.
-- Final checks: **256 passed, zero failed/skipped**; build exit 0; 3 infra tests passed. Repeatable feasibility harness `pnpm feasibility:mn` passed with 100% artifact reconciliation (9 authentic court PDFs replayed from `downloads/67-CV-26-300` and verified by SHA-256) and verified retrieval across compiled CLI, REST HTTP API, and real MCP child-process stdio.
+- Final checks: **263 passed, zero failed/skipped**; build exit 0; 3 infra tests passed. Repeatable feasibility harness `pnpm feasibility:mn` passed with 100% artifact reconciliation (9 authentic court PDFs replayed from `downloads/67-CV-26-300` and verified by SHA-256) and verified retrieval across compiled CLI, REST HTTP API, and real MCP child-process stdio.
 - `downloads/67-CV-26-300/` originals/manifests/dossiers and historical session exports remain in place, excluded from commits. No original PDF was moved, rewritten or purged.
 - Host development database: loopback 15439, database `court_dev`, schema `public`, thirteen migrations; persistent files `.runtime/postgres`, generated credentials `.runtime/database.env`/`.runtime/database.json` mode 0600. **Never print/share these files.**
 - Copied immutable storage: `.runtime/artifacts`; 11 verified objects including 9 original PDFs and 2 synthetic files.
-- Feasibility artifacts: `.runtime/feasibility/<run-id>/report.json` records machine-readable transport, readiness, reconciliation, search matrix, bulk query isolation, efficiency metrics, and crash recovery evidence.
+- Feasibility artifacts: `.runtime/feasibility/<run-id>/report.json` and retained live pilot runs under `.runtime/live-feasibility/<run-id>/` record machine-readable transport, readiness, reconciliation, search matrix, bulk query isolation, efficiency metrics, and crash recovery evidence.
 
 ## Start the local application
 
@@ -53,6 +53,29 @@ pnpm feasibility:mn
 ```
 
 This executes all feasibility stages (MN-F01–F05): subsystem readiness, browser transport contracts and isolation, authentic case acquisition for `67-CV-26-300` through durable worker queue and selective OCR, reconciliation table accounting, 7 search modes verification, mixed bulk query error isolation, docket reuse efficiency (`navsAvoided > 0`), and worker crash/recovery.
+
+## Human-assisted operator session & live acquisition (WO-MCRO-MN-LIVE-003)
+
+Live court portal requests are gated on explicit operator authorization. Do not accept terms or bypass challenges automatically.
+
+```sh
+# 1. Option A: Establish an isolated operator session in headed Chrome
+pnpm session:mn
+# (Review terms in the browser window, click 'Yes, I Accept', then press ENTER in the terminal)
+
+# 1. Option B: Import exported browser cookies (e.g. from Cookie-Editor)
+node scripts/session-interactive.mjs --import /path/to/cookies.json
+
+# 2. Inspect session status (verifies mode 0600 and cookies without secret disclosure)
+node dist/src/platform/courtctl.js session status
+
+# 3. Execute bounded live acquisition probe against real MinnesotaAdapter
+export COURT_ALLOW_LIVE_MN=true
+pnpm live:mn
+
+# 4. Clear/revoke session state when completed or expired
+node dist/src/platform/courtctl.js session clear
+```
 
 For repeatable offline acceptance:
 

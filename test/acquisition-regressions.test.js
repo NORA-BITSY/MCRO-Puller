@@ -398,7 +398,34 @@ test('queue pauses source-wide challenges and durably retains pending work', asy
   const result = await queue.run();
   assert.equal(result.status, 'blocked');
   assert.equal(result.stopped, true);
-  assert.equal(seen.length, 1);
+  // With concurrent workers, cases started in parallel with the blocked one
+  // may already be in flight; the source-wide pause guarantees no case beyond
+  // the concurrency ceiling is attempted and everything is durably retained.
+  assert.ok(seen.length >= 1 && seen.length <= 2, `expected at most concurrency-2 cases attempted, saw ${seen.length}`);
   assert.deepEqual(result.pending, ['27-CV-24-1', '27-CV-24-2', '27-CV-24-3']);
   assert.deepEqual(loadState(stateFile).queue.pending, result.pending);
+});
+
+test('worker pool assigns one sticky proxy per concurrent worker and completes all cases', async (t) => {
+  const stateFile = path.join(directory(t), 'state.json');
+  const proxies = [];
+  let concurrent = 0;
+  let peakConcurrency = 0;
+  const queue = new WorkerQueue({ stateFile, concurrency: 3, proxyPool: ['http://proxy-a:8080', 'http://proxy-b:8080'],
+    createBrowserClient: async (options) => { proxies.push(options.proxy); return { close: async () => {} }; },
+    crawlCase: async () => {
+      concurrent++; peakConcurrency = Math.max(peakConcurrency, concurrent);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      concurrent--;
+      return { success: true, status: 'complete' };
+    },
+  });
+  queue.addCases(['27-CV-24-101', '27-CV-24-102', '27-CV-24-103']);
+  const result = await queue.run();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.succeeded, 3);
+  // Every browser client egresses through a pool proxy (never undefined).
+  assert.ok(proxies.length >= 3 && proxies.every((proxy) => proxy === 'http://proxy-a:8080' || proxy === 'http://proxy-b:8080'),
+    `expected pool proxies only, saw ${proxies.join(',')}`);
+  assert.ok(peakConcurrency > 1, `expected concurrent crawl execution, peak was ${peakConcurrency}`);
 });

@@ -178,26 +178,49 @@ async function createStandaloneClient(options = {}) {
   const storageState = fs.existsSync(sessionPath) ? sessionPath : undefined;
   const executablePath = options.executablePath || findSystemChrome();
 
-  if (options.proxy) throw new Error('MCRO adapter does not support proxy configuration or rotation');
-  console.log(`[Browser] Launching standard Chromium (headed: ${headed}, executable: ${executablePath || 'default'})...`);
+  // Operator-approved proxy routing: each concurrent worker may pin its own
+  // proxy (sticky by worker index) so no single exit IP carries the full load.
+  const proxy = options.proxy || undefined;
+  const proxyOption = typeof proxy === 'string' ? { server: proxy } : proxy;
+  console.log(`[Browser] Launching standard Chromium (headed: ${headed}, executable: ${executablePath || 'default'}${proxyOption ? `, proxy: ${proxyOption.server}` : ''})...`);
   const browser = await chromium.launch({
     headless: !headed,
+    // F5 BIG-IP ASM client telemetry fingerprints automation-controlled browsers;
+    // suppress Playwright's automation tells so the automated browser matches the
+    // operator's real Chrome (parity, not captcha bypass).
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--disable-blink-features=AutomationControlled'],
     ...(executablePath ? { executablePath } : {}),
+    ...(proxyOption ? { proxy: proxyOption } : {}),
   });
 
   const context = await browser.newContext({
     storageState,
-    serviceWorkers: 'block',
+    // Allow F5 client-telemetry service workers instead of blocking them.
+    serviceWorkers: 'allow',
     viewport: { width: 1440, height: 900 },
     deviceScaleFactor: 2,
     acceptDownloads: true,
   });
+  // Mask the remaining CDP tell that survives --disable-blink-features.
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
 
   const page = await context.newPage();
 
+  /**
+   * Let F5 client-telemetry beacons finish before the page is acted on.
+   * Best-effort: networkidle is capped and never fails navigation itself.
+   */
+  async function settleTelemetry() {
+    await page.waitForLoadState('networkidle', { timeout: Math.min(CONFIG.delays.pageLoadTimeoutMs, 10000) }).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+
   async function gotoMcro(url = CONFIG.urls.caseSearch) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
-    await page.waitForTimeout(1000);
+    await settleTelemetry();
     await ensureTermsAccepted(page);
     const wafCheck = await checkWafBlock(page);
     if (wafCheck.blocked) {

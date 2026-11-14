@@ -42,4 +42,18 @@ export const CONFIG = {
   
   // Max retries per document
   maxRetries: envInteger('MCRO_MAX_RETRIES', 3, 1),
+
+  // Operator-approved concurrent live pull jobs. Hard ceiling 10 to start;
+  // cooperative jitter pacing still applies between requests per worker.
+  concurrency: envInteger('MCRO_CONCURRENCY', 10, 1),
+
+  // Live pull proxy pool. Comma-separated proxy URLs (one per concurrent
+  // worker, assigned stickily by worker index); COURT_PROXY is a single-proxy
+  // shorthand. Empty means direct connections.
+  proxyPool: (process.env.COURT_PROXIES || process.env.COURT_PROXY || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean),
 };
+
+export const MAX_PULL_CONCURRENCY = 10;

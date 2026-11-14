@@ -31,7 +31,7 @@ function capabilities(fixture: boolean): SourceCapabilities {
     searchModes: Object.fromEntries(Object.entries(SEARCH_MODES).map(([mode, shape]) => [mode, { required: shape.required, optional: shape.optional, verified: fixture ? 'fixture' : 'documented', limitations: fixture ? ['Synthetic records only; not a second real jurisdiction.'] : ['Documented in Minnesota SCAO 2022-08-05 guides; current live execution has not been verified.', ...(mode === 'party' || mode === 'business' || mode === 'hearing' ? ['Name searches omit pending criminal matters; absent results do not establish absence of a case.'] : [])] }])),
     resultLimit: fixture ? null : 200,
     exhaustiveDiscovery: fixture,
-    notes: fixture ? ['Independent synthetic IDs, record format, cursor pagination, source ordering, multiple attachments and restricted-artifact scenario.'] : ['COURT_ALLOW_LIVE_MN=true required before browser or portal access.', 'No CAPTCHA bypass, stealth, proxy rotation, or claim of statewide exhaustive discovery.', 'Raw source section labels and non-document events are preserved; unavailable public records remain outside coverage.'],
+    notes: fixture ? ['Independent synthetic IDs, record format, cursor pagination, source ordering, multiple attachments and restricted-artifact scenario.'] : ['COURT_ALLOW_LIVE_MN=true required before browser or portal access.', 'Operator-approved automation: browser-parity anti-fingerprinting and sticky per-worker proxy routing; no CAPTCHA solving, mid-session proxy rotation, or claim of statewide exhaustive discovery.', 'Raw source section labels and non-document events are preserved; unavailable public records remain outside coverage.'],
   };
 }
 
@@ -78,6 +78,8 @@ export interface MinnesotaBrowserOptions {
   headed?: boolean | undefined;
   sessionPath?: string | undefined;
   executablePath?: string | undefined;
+  /** Operator-approved proxy routing; sticky per worker, never rotated mid-session. */
+  proxy?: string | { server: string; username?: string; password?: string } | undefined;
 }
 
 export class MinnesotaAdapter implements CourtSourceAdapter {
@@ -103,6 +105,7 @@ export class MinnesotaAdapter implements CourtSourceAdapter {
           headed: this.browserOptions.headed,
           sessionPath: this.browserOptions.sessionPath,
           executablePath: this.browserOptions.executablePath,
+          proxy: this.browserOptions.proxy,
         });
         if (context.beforeRequest || context.signal) gate = await installSourceRequestGate(this.client.context, context);
         let value: T;
@@ -339,6 +342,7 @@ export function createAdapters(options: {
   headed?: boolean | undefined;
   sessionPath?: string | undefined;
   executablePath?: string | undefined;
+  proxy?: string | { server: string; username?: string; password?: string } | undefined;
   fixturePath?: string | undefined;
 } = {}): Map<string, CourtSourceAdapter> {
   const adapters: CourtSourceAdapter[] = [
@@ -347,6 +351,7 @@ export function createAdapters(options: {
       headed: options.headed,
       sessionPath: options.sessionPath,
       executablePath: options.executablePath,
+      proxy: options.proxy,
     }),
     new IndependentFixtureAdapter(options.fixturePath),
   ];

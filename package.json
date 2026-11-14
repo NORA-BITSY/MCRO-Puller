@@ -19,11 +19,15 @@
     "build": "tsc",
     "accept:mn": "node scripts/accept-minnesota.mjs",
     "feasibility:mn": "node scripts/feasibility-minnesota.mjs",
+    "session:mn": "node scripts/session-interactive.mjs",
+    "live:mn": "node scripts/feasibility-minnesota.mjs --live-adapter",
     "courtctl": "tsx src/platform/courtctl.ts",
     "api": "tsx src/platform/api.ts",
     "mcp": "tsx src/platform/mcp.ts",
     "worker": "tsx src/platform/worker.ts",
-    "dev:database": "tsx scripts/dev-database.ts"
+    "dev:database": "tsx scripts/dev-database.ts",
+    "decodo:mn": "node scripts/decodo-provision.mjs",
+    "decodo:check": "node scripts/decodo-provision.mjs --check"
   },
   "keywords": [],
   "author": "",

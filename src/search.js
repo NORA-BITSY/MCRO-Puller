@@ -1,5 +1,5 @@
 import { CONFIG } from './config.js';
-import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual, requireLiveMn } from './waf.js';
+import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual, requireLiveMn, sleepJitter } from './waf.js';
 import { COUNTIES } from './counties.js';
 
 function resolveCounty(value) {
@@ -109,12 +109,24 @@ async function visible(locator, label) {
 async function choose(page, label) {
   // These IDs were observed in the preserved MCRO session, not inferred.
   const observed = { Name: '#MpaCaseSearchNameTypeTab', Person: '#MpaCaseSearchNameTypePersonTab', Business: '#MpaCaseSearchNameTypeBusinessTab', 'Case Number': '#MpaCaseSearchCaseNumberTypeTab', 'Citation Number': '#MpaCaseSearchCitationNumberTypeTab', Attorney: '#MpaCaseSearchAttorneyTypeTab', County: '#mpaLocOptionToggleCounty' };
-  if (observed[label] && await page.locator(observed[label]).isVisible()) return page.locator(observed[label]).click();
+  if (observed[label] && await page.locator(observed[label]).isVisible()) {
+    await page.locator(observed[label]).click();
+    await page.waitForTimeout(300);
+    return;
+  }
   await (await visible(page.getByText(label, { exact: true }), label)).click();
+  await page.waitForTimeout(300);
 }
 async function field(page, label) {
   const observed = { 'Last Name': '#LastName', 'First Name': '#FirstName', 'Middle Name': '#MiddleName', 'Sounds Like': '#Soundex', 'Enter Case Number': '#CaseSearchNumber', 'Enter Citation Number': '#CaseSearchNumber', 'Enter Attorney Bar Number': '#CaseSearchNumber', 'Judicial Officer Name': '#JudicialOfficerName', 'Case Status': '#CaseStatus', 'Judgment Status': '#JudgmentStatus' };
-  if (observed[label] && await page.locator(observed[label]).isVisible()) return page.locator(observed[label]);
+  if (observed[label]) {
+    try {
+      await page.locator(observed[label]).waitFor({ state: 'visible', timeout: 3000 });
+      return page.locator(observed[label]);
+    } catch {
+      // Fall through to getByLabel
+    }
+  }
   return visible(page.getByLabel(labelPattern(label)), label);
 }
 async function fill(page, label, value) { if (value !== undefined) await (await field(page, label)).fill(value); }
@@ -209,7 +221,7 @@ export async function waitForSearchResults(page, timeoutMs = CONFIG.delays.searc
     await page.waitForFunction(() => {
       const text = document.body.innerText;
       return document.querySelector('#mpaCardsWrapper, form[action*="DownloadDocument"]') ||
-        /Your search returned no results|No (?:cases|hearings|judgments) were found|Documents Available Online|The value .*not valid|field is required|access denied|request blocked|verify you are human/i.test(text);
+        /Your search returned no results|No (?:cases|hearings|judgments) were found|Documents Available Online|The value .*not valid|field is required|access denied|request blocked|the requested url was rejected|verify you are human/i.test(text);
     }, undefined, { timeout: timeoutMs });
   } catch (error) {
     const challenge = await checkWafBlock(page);
@@ -224,8 +236,12 @@ export async function executeSearch(page, input) {
   requireLiveMn();
   const endpoint = { document: CONFIG.urls.documentSearch, hearing: CONFIG.urls.hearingSearch, judgment: new URL('JudgmentSearch', CONFIG.urls.caseSearch).href }[query.searchType] || CONFIG.urls.caseSearch;
   await page.goto(endpoint, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
+  // Let F5 client-telemetry settle before interacting, then pause like a human
+  // before submitting; instant submits are a bot tell.
+  await page.waitForLoadState('networkidle', { timeout: Math.min(CONFIG.delays.pageLoadTimeoutMs, 10000) }).catch(() => {});
   await assertSearchPageHealthy(page, 'Search'); await ensureTermsAccepted(page);
   await applyQuery(page, query);
+  await sleepJitter();
   const buttonId = { document: '#btnFindCaseByNumber', judgment: '#btnJudgmentSearch', hearing: '#btnHearingSearch' }[query.searchType] || '#btnCaseSearch';
   await page.locator(buttonId).click();
   // MCRO changes the DOM without navigating. A navigation-only wait previously
