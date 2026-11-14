@@ -20,124 +20,14 @@ import { MinnesotaAdapter, mapRoa } from '../dist/src/platform/adapters.js';
 import { findSystemChrome } from '../dist/src/browser.js';
 import { chromium } from 'playwright';
 import { CONFIG } from '../dist/src/config.js';
+import { createLiveBudgetContext, evaluateLiveGates, isLiveModeEnabled } from '../src/platform/live-acceptance.js';
+import { caseNumbersEqual } from '../src/waf.js';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const downloadsDir = path.join(root, 'downloads', '67-CV-26-300');
 const caseNumber = '67-CV-26-300';
 
-/**
- * Pure helper for R003-1: Live mode activation requires BOTH
- * process opt-in (COURT_ALLOW_LIVE_MN=true) AND explicit CLI flag (--live-adapter or --live).
- */
-export function isLiveModeEnabled(env = process.env, argv = process.argv) {
-  const hasEnvOptIn = env.COURT_ALLOW_LIVE_MN === 'true';
-  const hasCliFlag = argv.includes('--live-adapter') || argv.includes('--live');
-  return hasEnvOptIn && hasCliFlag;
-}
-
-/**
- * Pure helper for R003-2, R003-4: Accurate Gate L1-L4 accounting and error attribution.
- */
-export function evaluateLiveGates(input) {
-  const gates = {
-    L1_local: 'passed (256/256 tests, CLI/HTTP/MCP, authentic corpus replay)',
-    L2_live_source_search: 'pending_operator_gate',
-    L3_live_document: 'pending_operator_gate',
-    L4_repeatability: 'pending_operator_gate',
-  };
-
-  // Evaluate Gate L2: Live Source Search & Docket
-  if (input.stageFailed === 'search') {
-    gates.L2_live_source_search = input.error?.code === 'blocked'
-      ? `blocked (${input.error.message})`
-      : `failed (search error: ${input.error?.message})`;
-    return gates;
-  }
-
-  // Check if search returned matching case (R003-2: zero matches is NOT L2 success)
-  const matches = input.searchResults || [];
-  const foundTarget = matches.some((c) => c.caseNumber && c.caseNumber.toUpperCase() === input.targetCaseNumber.toUpperCase());
-  if (!foundTarget) {
-    gates.L2_live_source_search = matches.length === 0
-      ? 'no_results (target case not found)'
-      : 'unavailable (returned different case)';
-    return gates;
-  }
-
-  if (input.stageFailed === 'docket') {
-    gates.L2_live_source_search = input.error?.code === 'blocked'
-      ? `blocked (${input.error.message})`
-      : `failed (docket error: ${input.error?.message})`;
-    return gates;
-  }
-
-  if (!input.caseObservation) {
-    gates.L2_live_source_search = 'pending_docket';
-    return gates;
-  }
-
-  // L2 is passed when matching case AND complete docket are observed
-  gates.L2_live_source_search = `passed (${input.caseObservation.entries.length} entries observed)`;
-
-  // Evaluate Gate L3: Live Document Acquisition
-  // (R003-4: document download failure must NOT erase successful L2 search!)
-  if (input.stageFailed === 'download') {
-    gates.L3_live_document = input.error?.code === 'blocked'
-      ? `blocked (${input.error.message})`
-      : `failed (${input.error?.code || 'error'}: ${input.error?.message})`;
-    return gates;
-  }
-
-  if (!input.documentObservation) {
-    gates.L3_live_document = 'pending';
-    return gates;
-  }
-
-  gates.L3_live_document = `passed (${input.documentObservation.filename}, ${input.documentObservation.bytes.length} bytes)`;
-
-  // Evaluate Gate L4: Repeatability
-  // (R003-2: single download does not satisfy L4; requires repeat observation)
-  if (input.stageFailed === 'repeat') {
-    gates.L4_repeatability = `failed (${input.error?.message})`;
-    return gates;
-  }
-
-  if (input.repeatObservation) {
-    gates.L4_repeatability = 'passed (repeat observation verified)';
-  } else {
-    gates.L4_repeatability = 'pending (repeat observation required)';
-  }
-
-  return gates;
-}
-
-/**
- * Budget enforcement context helper for R003-5
- */
-export function createLiveBudgetContext(limits) {
-  let requestsMade = 0;
-  let bytesReceived = 0;
-
-  return {
-    signal: limits.signal,
-    get requestsMade() { return requestsMade; },
-    get bytesReceived() { return bytesReceived; },
-    async beforeRequest() {
-      limits.signal?.throwIfAborted();
-      if (requestsMade >= limits.maxRequests) {
-        throw Object.assign(new Error(`Live pilot request budget exceeded: ${limits.maxRequests}`), { code: 'budget_exceeded' });
-      }
-      requestsMade++;
-    },
-    recordBytes(bytes) {
-      bytesReceived += bytes;
-      if (bytesReceived > limits.maxBytes) {
-        throw Object.assign(new Error(`Live pilot byte ceiling exceeded: ${limits.maxBytes}`), { code: 'budget_exceeded' });
-      }
-    },
-  };
-}
 
 /**
  * GroundedMinnesotaAdapter serves authentic grounded records for 67-CV-26-300
@@ -328,6 +218,21 @@ async function drainWorker(service, workerId = 'feasibility-worker') {
   return completed;
 }
 
+async function acceptanceCodeHash() {
+  const files = [
+    'scripts/feasibility-minnesota.mjs',
+    'scripts/session-interactive.mjs',
+    'src/platform/adapters.ts',
+    'src/platform/service.ts',
+    'src/platform/worker.ts',
+    'src/platform/live-acceptance.js',
+    'src/waf.js',
+  ];
+  const digest = createHash('sha256');
+  for (const file of files) digest.update(file).update('\\0').update(await readFile(path.join(root, file)));
+  return digest.digest('hex');
+}
+
 // Subprocess worker handler for crash test
 if (process.argv.includes('--crash-worker')) {
   const base = process.env.COURT_DATABASE_URL;
@@ -356,7 +261,7 @@ if (!process.argv.includes('--crash-worker')) {
   const runId = randomUUID().slice(0, 8);
   const feasibilityDir = path.join(root, '.runtime', runPrefix, runId);
   const artifactsDir = path.join(feasibilityDir, 'artifacts');
-  await mkdir(artifactsDir, { recursive: true });
+  await mkdir(artifactsDir, { recursive: true, mode: 0o700 });
 
   console.log(`\n======================================================`);
   console.log(`  MCRO Minnesota ${isLive ? 'Live Source Integration' : 'Technical Feasibility'} Run [${runId}]`);
@@ -391,11 +296,27 @@ if (!process.argv.includes('--crash-worker')) {
     return JSON.parse(result.stdout);
   }
 
-  let apiServer, mcpClient;
+  let apiServer, mcpClient, pool, sourceAdapter;
   const metrics = {
     runId,
     startedAt: new Date(startedAt).toISOString(),
     elapsedMs: 0,
+    codeHash: null,
+    environment: {
+      node: process.version,
+      browserMode: 'standalone',
+      proxyConfigured: Boolean(process.env.COURT_PROXY || process.env.COURT_PROXIES),
+      sessionFilePresent: Boolean(process.env.COURT_SESSION_FILE && existsSync(process.env.COURT_SESSION_FILE)),
+    },
+    liveExperiment: isLive ? {
+      sourceUrl: 'https://publicaccess.courts.state.mn.us/CaseSearch',
+      selectedCaseNumber: caseNumber,
+      isolatedSchema,
+      operatorIntervention: 'not recorded by runner; terms consent is never automated',
+      requestLimit: 150,
+      documentLimit: 15,
+      byteLimit: 128 * 1024 * 1024,
+    } : undefined,
     transport: {},
     readiness: {},
     reconciliation: {},
@@ -406,6 +327,7 @@ if (!process.argv.includes('--crash-worker')) {
   };
 
   try {
+    metrics.codeHash = await acceptanceCodeHash();
     // -----------------------------------------------------------
     // Step 1: Create isolated schema & migrate database
     // -----------------------------------------------------------
@@ -443,111 +365,31 @@ if (!process.argv.includes('--crash-worker')) {
       serviceWorkers: 'block',
       acceptDownloads: true,
     });
-    const page = await browserCtx.newPage();
-
-    let liveStatus = 'offline_default';
-    let tcModalObserved = false;
-    let autoConsentBlocked = false;
+    let liveStatus = isLive ? 'pending durable MinnesotaAdapter worker execution' : 'offline_default';
+    const tcModalObserved = false;
+    const sessionFile = process.env.COURT_SESSION_FILE || CONFIG.sessionFile || path.join(os.homedir(), '.mcro-puller', 'session.json');
+    const courtProxies = (process.env.COURT_PROXIES || '').split(',').map((entry) => entry.trim()).filter(Boolean);
+    const proxy = process.env.COURT_PROXY || courtProxies[0];
+    const liveBudget = isLive ? createLiveBudgetContext({
+      maxRequests: 150,
+      maxBytes: 128 * 1024 * 1024,
+      maxDocuments: 15,
+    }) : undefined;
     let liveGates = {
-      L1_local: 'passed (256/256 tests, CLI/HTTP/MCP, authentic corpus replay)',
+      L1_local: 'not evaluated in this run',
       L2_live_source_search: 'pending_operator_gate',
       L3_live_document: 'pending_operator_gate',
       L4_repeatability: 'pending_operator_gate',
     };
-
-    // Live source probe: requires BOTH explicit flag (--live-adapter or --live) AND COURT_ALLOW_LIVE_MN=true
-    if (isLive) {
-      console.log(`  [Live Mode Active] Executing live Minnesota source probe under budget enforcement...`);
-      const sessionFile = process.env.COURT_SESSION_FILE || CONFIG.sessionFile || path.join(os.homedir(), '.mcro-puller', 'session.json');
-      const sessionPresent = existsSync(sessionFile);
-      console.log(`  - Session State: ${sessionPresent ? `present at ${sessionFile}` : 'absent (operator review gate active)'}`);
-
-      const liveBudget = createLiveBudgetContext({
-        maxRequests: 50,
-        maxBytes: 64 * 1024 * 1024,
-      });
-
-      try {
-        console.log(`  - Navigating to MCRO portal: https://publicaccess.courts.state.mn.us/CaseSearch...`);
-        const resp = await page.goto('https://publicaccess.courts.state.mn.us/CaseSearch', {
-          waitUntil: 'domcontentloaded',
-          timeout: 25000,
-        });
-        liveStatus = resp ? `HTTP ${resp.status()}` : 'no_response';
-        const title = await page.title();
-        const acceptBtn = page.locator('#tcModalAcceptBtn');
-        tcModalObserved = await acceptBtn.isVisible().catch(() => false);
-
-        if (process.env.COURT_AUTO_ACCEPT_TERMS !== 'true') {
-          autoConsentBlocked = tcModalObserved;
-          console.log(`  - Live MCRO landing observed: ${liveStatus} (${title})`);
-          console.log(`  - Terms & Conditions modal visible: ${tcModalObserved}`);
-          if (tcModalObserved) {
-            console.log(`  - Operator Confirmation Gate: Automated terms acceptance refused on user's behalf (blocked)`);
-          }
-        }
-      } catch (err) {
-        liveStatus = `error: ${err.message}`;
-      }
-
-      // Operator-approved proxy routing: if COURT_PROXIES is set, the live probe
-      // egresses through the first Decodo sticky session (US exit IP).
-      const courtProxies = (process.env.COURT_PROXIES || '').split(',').map((entry) => entry.trim()).filter(Boolean);
-      const proxy = process.env.COURT_PROXY || courtProxies[0];
-      console.log(`  - Probing production MinnesotaAdapter against live portal${proxy ? ` via proxy ${proxy.replace(/\/\/.*@/, '//')}` : ''}...`);
-      const liveAdapter = new MinnesotaAdapter('standalone', {
-        headed: process.env.COURT_BROWSER_HEADED === 'true',
-        sessionPath: sessionFile,
-        proxy,
-      });
-
-      let searchResult = null;
-      let caseObservation = null;
-      let docObservation = null;
-      let stageFailed = null;
-      let liveError = null;
-
-      try {
-        searchResult = await liveAdapter.searchCases({ sourceId: 'mn-mcro', searchType: 'case', caseNumber }, liveBudget);
-        const matches = searchResult.cases.filter((c) => c.caseNumber && c.caseNumber.toUpperCase() === caseNumber);
-
-        if (matches.length > 0) {
-          try {
-            caseObservation = await liveAdapter.fetchCase(caseNumber, liveBudget);
-            const firstDoc = caseObservation.entries.flatMap((e) => e.documents).find((d) => d.availability === 'available');
-            if (firstDoc) {
-              try {
-                docObservation = await liveAdapter.fetchDocument(firstDoc, liveBudget);
-              } catch (docErr) {
-                stageFailed = 'download';
-                liveError = docErr;
-              }
-            }
-          } catch (docketErr) {
-            stageFailed = 'docket';
-            liveError = docketErr;
-          }
-        }
-      } catch (searchErr) {
-        stageFailed = 'search';
-        liveError = searchErr;
-      } finally {
-        await liveAdapter.close().catch(() => {});
-      }
-
-      liveGates = evaluateLiveGates({
-        targetCaseNumber: caseNumber,
-        searchResults: searchResult?.cases,
-        caseObservation,
-        documentObservation: docObservation,
-        stageFailed,
-        error: liveError,
-      });
-      console.log(`  - Live Search Result: ${liveGates.L2_live_source_search}`);
-      console.log(`  - Live Document Result: ${liveGates.L3_live_document}`);
+      metrics.environment.sessionFilePresent = existsSync(sessionFile);
+      metrics.environment.proxyConfigured = Boolean(proxy);
+      metrics.liveExperiment.sessionFilePresent = existsSync(sessionFile);
+      console.log('  [Live Mode Active] Source traffic will run only through the durable MinnesotaAdapter service/worker path.');
+      console.log(`  - Saved session file: ${existsSync(sessionFile) ? 'present (previously verified by interactive session flow)' : 'absent'}`);
+      console.log(`  - Request/PDF/body ceilings: 150 requests / 15 PDFs / 128 MiB`);
     } else {
-      console.log(`  [Offline Replay Mode] Preserving network-free replay default (no portal navigation).`);
-      liveStatus = 'offline_default (network-free replay)';
+      console.log('  [Offline Replay Mode] Preserving network-free replay default (no portal navigation).');
+      liveStatus = 'offline_default (no portal navigation)';
     }
 
     await browserCtx.close();
@@ -557,33 +399,36 @@ if (!process.argv.includes('--crash-worker')) {
       browserMode: 'standalone',
       executablePath: systemChrome,
       isolatedContextCreated: true,
-      requestInterceptionSupported: true,
+      standaloneBrowserCreated: true,
       extensionCDPIsolationSupported: false,
       extensionCDPFailureReason: 'Target.createBrowserContext unsupported by Playwriter CDP bridge',
       livePortalStatus: liveStatus,
-      termsModalObserved: tcModalObserved,
-      operatorConfirmationGateEnforced: autoConsentBlocked,
+      sourceRequestBudgetConnected: Boolean(liveBudget),
+      termsConsentAutomationDisabled: true,
     };
 
     metrics.gates = liveGates;
 
+
     // -----------------------------------------------------------
-    // Step 4: Grounded Case Acquisition & Document Pipeline (MN-F02)
-    // -----------------------------------------------------------
-    console.log(`[4/6] Processing grounded case ${caseNumber} across full pipeline (MN-F02)...`);
-    const pool = createDatabase(isolatedDbUrl.href);
+    // The same MinnesotaAdapter feeds the durable service in live mode; replay
+    // is selected only when live opt-in is absent.
+    console.log(`[4/6] Processing ${isLive ? 'live source' : 'offline replay'} case ${caseNumber} through the durable platform pipeline...`);
+    pool = createDatabase(isolatedDbUrl.href);
     const store = new LocalArtifactStore(artifactsDir);
-    const adapter = new GroundedMinnesotaAdapter();
-    const service = new CourtService(pool, store, new Map([['mn-mcro', adapter]]));
+    sourceAdapter = isLive
+      ? new MinnesotaAdapter('standalone', { headed: process.env.COURT_BROWSER_HEADED === 'true', sessionPath: sessionFile, proxy })
+      : new GroundedMinnesotaAdapter();
+    const adapter = sourceAdapter;
+    const service = new CourtService(pool, store, new Map([['mn-mcro', adapter]]), liveBudget);
     await service.registerSources();
 
-    // Enable source in isolated database with 0 minimum interval for feasibility testing
-    await pool.query("UPDATE sources SET enabled=true, min_interval_ms=0 WHERE id='mn-mcro'");
+    // Keep configured source pacing for live traffic. Offline replay is local.
+    await pool.query("UPDATE sources SET enabled=true, min_interval_ms=CASE WHEN $1 THEN min_interval_ms ELSE 0 END, max_concurrency=1 WHERE id='mn-mcro'", [isLive]);
 
     // Submit case acquisition via CLI
     const acquireQuery = { sourceId: 'mn-mcro', searchType: 'case', caseNumber };
     const acquireJob = await cli('acquire', '--query', JSON.stringify(acquireQuery), '--idempotency-key', `feasibility-single-${runId}`);
-    assert.ok(acquireJob.jobId, 'Acquisition job must be enqueued');
 
     // Idempotency check: submitting identical query returns same jobId
     const acquireJobDup = await cli('acquire', '--query', JSON.stringify(acquireQuery), '--idempotency-key', `feasibility-single-${runId}`);
@@ -593,49 +438,91 @@ if (!process.argv.includes('--crash-worker')) {
     const completedInitial = await drainWorker(service, 'feasibility-worker-1');
     console.log(`  - Worker completed ${completedInitial} durable tasks`);
 
-    // Verify case in database
     const dbCases = await cli('db', 'search', '--state', 'MN');
-    assert.equal(dbCases.data.length, 1);
-    const caseRecord = dbCases.data[0];
+    const caseRecord = dbCases.data.find((candidate) => caseNumbersEqual(candidate.caseNumber, caseNumber));
+    const searchJob = (await pool.query('SELECT status,error FROM jobs WHERE id=$1', [acquireJob.jobId])).rows[0];
+    const searchCoverage = (await pool.query("SELECT status FROM coverage_observations WHERE job_id=$1 AND dimension='discovery'", [acquireJob.jobId])).rows[0];
+    if (!caseRecord) {
+      liveGates = evaluateLiveGates({
+        targetCaseNumber: caseNumber,
+        searchResults: dbCases.data,
+        searchComplete: searchCoverage?.status === 'observed',
+        ...(searchJob?.status === 'complete' || searchJob?.status === 'partial' ? {} : {
+          stageFailed: 'search',
+          error: searchJob?.error || { code: 'retryable', message: 'Durable source-search job did not complete' },
+        }),
+      });
+      metrics.gates = liveGates;
+      metrics.liveSearch = { jobId: acquireJob.jobId, status: searchJob?.status ?? 'missing', coverage: searchCoverage?.status ?? 'missing', casesObserved: dbCases.data.length };
+      assert.ok(caseRecord, `No selected case was observed through the durable source-search job; L2=${liveGates.L2_live_source_search}. No replay fallback is permitted.`);
+    }
     const caseId = caseRecord.id;
-
-    // Verify docket
     const docketResult = await cli('case', 'docket', caseId);
     const docketEntries = docketResult.data;
-    assert.equal(docketEntries.length, 10, 'Must contain 9 document entries + 1 procedural non-document entry');
+    const documents = docketEntries.flatMap((entry) => entry.documents);
+    const latestSnapshot = (await pool.query('SELECT complete,sha256 FROM docket_snapshots WHERE case_id=$1 ORDER BY observed_at DESC,id DESC LIMIT 1', [caseId])).rows[0];
+    const searchComplete = searchCoverage?.status === 'observed';
 
-    // Count documents
-    const documents = docketEntries.flatMap((e) => e.documents);
-    assert.equal(documents.length, 9, 'Must contain exactly 9 authentic documents');
-
-    // Verify storage integrity
+    // Verify storage integrity and extracted artifact provenance.
     const storageCheck = await cli('storage', 'verify');
-    assert.equal(storageCheck.checked, 9);
-    assert.equal(storageCheck.valid, 9);
+    if (!isLive) {
+      assert.equal(docketEntries.length, 10, 'Replay must contain 9 document entries + 1 procedural event');
+      assert.equal(documents.length, 9, 'Replay corpus must contain exactly 9 documents');
+      assert.equal(storageCheck.checked, 9);
+      assert.equal(storageCheck.valid, 9);
+    }
     assert.equal(storageCheck.failures.length, 0);
+    const acquiredDocumentIds = new Set((await pool.query('SELECT id FROM documents WHERE case_id=$1 AND current_version_id IS NOT NULL ORDER BY id', [caseId])).rows.map((row) => row.id));
+    const sampleDoc = documents.find((document) => acquiredDocumentIds.has(document.id));
+    if (isLive && !sampleDoc) {
+      liveGates = evaluateLiveGates({
+        targetCaseNumber: caseNumber,
+        searchResults: dbCases.data,
+        searchComplete,
+        caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
+      });
+      metrics.gates = liveGates;
+      assert.ok(sampleDoc, `No acquired public document is available through the durable pipeline; L3=${liveGates.L3_live_document}. No replay fallback is permitted.`);
+    }
+    assert.ok(sampleDoc, 'The selected case must have an acquired document for text/API/MCP verification');
+    const artifactEvidence = (await pool.query(`SELECT dv.filename,a.size_bytes::int AS bytes,a.sha256,
+      EXISTS(SELECT 1 FROM extraction_runs er WHERE er.document_version_id=dv.id AND er.status IN ('complete','partial')) AS extracted
+      FROM documents d JOIN document_versions dv ON dv.id=d.current_version_id JOIN artifacts a ON a.id=dv.artifact_id WHERE d.id=$1`, [sampleDoc.id])).rows[0];
+    liveGates = evaluateLiveGates({
+      targetCaseNumber: caseNumber,
+      searchResults: dbCases.data,
+      searchComplete,
+      caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
+    });
 
-    // Build Reconciliation Table (MN-F02)
     const reconciliationTable = {
-      caseNumber,
+      caseNumber: caseRecord.caseNumber,
       sourceEventsObserved: docketEntries.length,
       documentReferences: documents.length,
-      replayedFromCorpus: 9,
-      downloaded: 9, // replayed from downloads/67-CV-26-300
-      previouslyVerified: 0,
-      restricted: 0,
-      failed: 0,
-      pending: 0,
-      storedVersions: 9,
+      replayedFromCorpus: isLive ? 0 : documents.length,
+      networkDownloaded: isLive ? storageCheck.valid : 0,
+      storedVersions: storageCheck.checked,
       storageIntegrityFailures: storageCheck.failures.length,
     };
     metrics.reconciliation = reconciliationTable;
+    metrics.gates = liveGates;
+    metrics.liveSearch = {
+      jobId: acquireJob.jobId,
+      status: searchJob?.status ?? 'missing',
+      coverage: searchCoverage?.status ?? 'missing',
+      casesObserved: dbCases.data.length,
+      targetCaseNumber: caseRecord.caseNumber,
+      docketSnapshot: latestSnapshot?.sha256 ?? null,
+      requestBudget: liveBudget ? { used: liveBudget.requestsMade, max: 150 } : undefined,
+      byteBudget: liveBudget ? { used: liveBudget.bytesReceived, max: 128 * 1024 * 1024 } : undefined,
+      documentBudget: liveBudget ? { reserved: liveBudget.documentsReserved, max: 15 } : undefined,
+    };
     console.log(`  - Reconciliation:`, JSON.stringify(reconciliationTable));
 
     // Verify retrieval across compiled CLI, HTTP API, and MCP
     console.log(`  - Verifying retrieval across CLI, HTTP API, and MCP...`);
 
     // CLI retrieval of document text
-    const sampleDoc = documents[0];
     const cliDocText = await cli('document', 'text', sampleDoc.id);
     assert.ok(cliDocText.data.length > 0, 'CLI must retrieve extracted document text');
     assert.ok(cliDocText.data[0].text.length > 0, 'Document text must not be empty');
@@ -648,12 +535,12 @@ if (!process.argv.includes('--crash-worker')) {
     const httpCases = await fetch(`${apiAddress}/api/v1/cases`, { headers: authHeaders });
     assert.equal(httpCases.status, 200);
     const httpCasesBody = await httpCases.json();
-    assert.equal(httpCasesBody.data.length, 1);
+    assert.ok(httpCasesBody.data.some((item) => item.id === caseId), 'HTTP API must expose the acquired case');
 
     const httpDocket = await fetch(`${apiAddress}/api/v1/cases/${caseId}/docket`, { headers: authHeaders });
     assert.equal(httpDocket.status, 200);
     const httpDocketBody = await httpDocket.json();
-    assert.equal(httpDocketBody.data.length, 10);
+    assert.equal(httpDocketBody.data.length, docketEntries.length);
 
     const httpPdf = await fetch(`${apiAddress}/api/v1/documents/${sampleDoc.id}/content`, { headers: authHeaders });
     assert.equal(httpPdf.status, 200);
@@ -678,14 +565,23 @@ if (!process.argv.includes('--crash-worker')) {
     const mcpDocket = await mcpClient.callTool({ name: 'get_case_docket', arguments: { id: caseId } });
     assert.ok(!mcpDocket.isError, 'MCP get_case_docket must succeed');
     const mcpDocketData = JSON.parse(mcpDocket.content[0].text);
-    assert.equal(mcpDocketData.data.length, 10);
+    assert.equal(mcpDocketData.data.length, docketEntries.length);
 
     const mcpText = await mcpClient.callTool({ name: 'get_document_text', arguments: { id: sampleDoc.id } });
     assert.ok(!mcpText.isError, 'MCP get_document_text must succeed');
     const mcpTextData = JSON.parse(mcpText.content[0].text);
     assert.ok(mcpTextData.data.length > 0);
+    liveGates = evaluateLiveGates({
+      targetCaseNumber: caseNumber,
+      searchResults: dbCases.data,
+      searchComplete,
+      caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
+      documentObservation: isLive && artifactEvidence ? { ...artifactEvidence, persisted: storageCheck.failures.length === 0 } : undefined,
+    });
+    metrics.gates = liveGates;
 
     // -----------------------------------------------------------
+    if (!isLive) {
     // Step 5: Search Modes Matrix & Bulk Query Proof (MN-F03)
     // -----------------------------------------------------------
     console.log(`[5/6] Testing search modes matrix and mixed bulk batches (MN-F03)...`);
@@ -729,6 +625,10 @@ if (!process.argv.includes('--crash-worker')) {
       neighborIsolation: true,
     };
 
+    } else {
+      metrics.searchMatrix = { status: 'not exercised in bounded live pilot; see offline acceptance separately' };
+      metrics.bulkResults = { status: 'skipped to preserve one-case live request budget' };
+    }
     // -----------------------------------------------------------
     // Step 6: Refresh, Efficiency & Recovery Verification (MN-F04)
     // -----------------------------------------------------------
@@ -737,8 +637,8 @@ if (!process.argv.includes('--crash-worker')) {
     // Measure efficiency metrics on adapter
     const efficiency = adapter.getEfficiencyMetrics();
     metrics.efficiency = {
-      docketFetches: adapter.navCount,
-      requestsExecuted: adapter.requestCount,
+      docketFetches: efficiency.docketFetches ?? adapter.navCount,
+      requestsExecuted: liveBudget?.requestsMade ?? adapter.requestCount,
       navsAvoided: efficiency.navsAvoided,
       documentsDownloaded: efficiency.documentDownloads,
     };
@@ -750,12 +650,14 @@ if (!process.argv.includes('--crash-worker')) {
 
     await drainWorker(service, 'feasibility-refresh-worker');
     const postRefreshDocket = await cli('case', 'docket', caseId);
-    assert.equal(postRefreshDocket.data.length, 10);
+    if (!isLive) assert.equal(postRefreshDocket.data.length, 10);
 
-    // Verify storage count didn't duplicate
     const postRefreshStorage = await cli('storage', 'verify');
-    assert.equal(postRefreshStorage.checked, 9);
-    assert.equal(postRefreshStorage.valid, 9);
+    if (!isLive) {
+      assert.equal(postRefreshStorage.checked, 9);
+      assert.equal(postRefreshStorage.valid, 9);
+    }
+    assert.equal(postRefreshStorage.failures.length, 0);
 
     // Crash and recovery test
     const crashDocVersion = (await pool.query('SELECT current_version_id AS id FROM documents WHERE current_version_id IS NOT NULL LIMIT 1')).rows[0].id;
@@ -791,6 +693,36 @@ if (!process.argv.includes('--crash-worker')) {
       completedWithoutDuplicateRows: true,
     };
 
+    if (isLive) {
+      const snapshots = (await pool.query('SELECT complete,sha256 FROM docket_snapshots WHERE case_id=$1 ORDER BY observed_at DESC,id DESC LIMIT 2', [caseId])).rows;
+      const hasRepeat = snapshots.length === 2;
+      const repeat = snapshots[0];
+      liveGates = evaluateLiveGates({
+        targetCaseNumber: caseNumber,
+        searchResults: dbCases.data,
+        searchComplete,
+        caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
+        documentObservation: artifactEvidence ? { ...artifactEvidence, persisted: storageCheck.failures.length === 0 } : undefined,
+        ...(hasRepeat && repeat ? { repeatObservation: {
+          caseNumber: caseRecord.caseNumber,
+          complete: repeat.complete,
+          persisted: true,
+          recoveryVerified: metrics.recovery.leaseExpiredAndReclaimed === true,
+        } } : {}),
+      });
+      metrics.gates = liveGates;
+      metrics.liveSearch = {
+        ...metrics.liveSearch,
+        requestBudget: { used: liveBudget.requestsMade, max: 150 },
+        byteBudget: { used: liveBudget.bytesReceived, max: 128 * 1024 * 1024 },
+        documentBudget: { reserved: liveBudget.documentsReserved, max: 15 },
+        repeatObservation: hasRepeat ? {
+          snapshotSha256: repeat?.sha256,
+          comparison: snapshots[0]?.sha256 === snapshots[1]?.sha256 ? 'no_change' : 'changed',
+        } : 'not_observed',
+      };
+    }
+
     // -----------------------------------------------------------
     // Finalization & Report Output
     // -----------------------------------------------------------
@@ -806,25 +738,32 @@ if (!process.argv.includes('--crash-worker')) {
     console.log(`  Elapsed Time:        ${metrics.elapsedMs} ms`);
     console.log(`  Isolated Schema:     ${isolatedSchema}`);
     console.log(`  Report Location:     ${reportPath}`);
-    console.log(`  Artifacts Stored:    ${postRefreshStorage.valid} files (${reconciliationTable.replayedFromCorpus} replayed from authentic corpus)`);
-    console.log(`  Reconciliation:      100% accounted for (0 missing, 0 corrupt)`);
-    console.log(`  Browser Standalone:  Verified (System Chrome: ${systemChrome})`);
-    console.log(`  Terms Gate:          Enforced (Refusing automated consent)`);
-    console.log(`  Search Modes:        7 modes validated, mixed bulk isolated`);
-    console.log(`  Crash Recovery:      Verified`);
-    console.log(`  Gate L1 (Local):     ${metrics.gates.L1_local}`);
+    console.log(`  Artifacts stored:   ${postRefreshStorage.valid}; corpus replay: ${reconciliationTable.replayedFromCorpus}; live downloads: ${reconciliationTable.networkDownloaded}`);
+    console.log(`  Storage integrity:  ${postRefreshStorage.valid}/${postRefreshStorage.checked} valid`);
+    console.log(`  Browser Standalone: Verified (System Chrome: ${systemChrome})`);
+    console.log(`  Terms Gate:         Automated consent disabled; operator action remains human`);
+    console.log(`  Search Modes:      ${isLive ? 'not exercised in live request budget' : 'offline matrix and mixed bulk validated'}`);
+    console.log(`  Crash Recovery:    Verified`);
+    console.log(`  Gate L1 (Local):   ${metrics.gates.L1_local}`);
     console.log(`  Gate L2 (Live Search): ${metrics.gates.L2_live_source_search}`);
-    console.log(`  Gate L3 (Live Doc):  ${metrics.gates.L3_live_document}`);
-    console.log(`  Gate L4 (Repeat):    ${metrics.gates.L4_repeatability}`);
-    console.log(`======================================================\n`);
+    console.log(`  Gate L3 (Live Doc): ${metrics.gates.L3_live_document}`);
+    console.log(`  Gate L4 (Repeat):  ${metrics.gates.L4_repeatability}`);
+  } catch (error) {
+    metrics.failure = {
+      code: error && typeof error === 'object' && typeof error.code === 'string' ? error.code : 'unclassified',
+      message: error instanceof Error ? error.message.replace(/([?&](?:token|key|signature|session)=)[^&\\s]+/gi, '$1[redacted]') : 'Unclassified feasibility failure',
+    };
+    throw error;
   } finally {
     metrics.elapsedMs = Date.now() - startedAt;
     const reportPath = path.join(feasibilityDir, 'report.json');
-    await writeFile(reportPath, JSON.stringify(metrics, null, 2)).catch(() => {});
+    await writeFile(reportPath, JSON.stringify(metrics, null, 2), { mode: 0o600 }).catch(() => {});
 
     await mcpClient?.close().catch(() => {});
     await apiServer?.close().catch(() => {});
 
+    await sourceAdapter?.close().catch(() => {});
+    await pool?.end().catch(() => {});
     if (isLive) {
       console.log(`\n[Retention Policy] Live pilot schema "${isolatedSchema}" and artifacts in ${feasibilityDir} retained for inspection and resumption.`);
       await adminPool.end().catch(() => {});

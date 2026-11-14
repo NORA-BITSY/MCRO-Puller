@@ -1,148 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-
-/**
- * Pure helper for R003-1: Live mode activation requires BOTH
- * process opt-in (COURT_ALLOW_LIVE_MN=true) AND explicit CLI flag (--live-adapter or --live).
- */
-export function isLiveModeEnabled(env: Record<string, string | undefined> = process.env, argv: string[] = process.argv): boolean {
-  const hasEnvOptIn = env.COURT_ALLOW_LIVE_MN === 'true';
-  const hasCliFlag = argv.includes('--live-adapter') || argv.includes('--live');
-  return hasEnvOptIn && hasCliFlag;
-}
-
-export interface GateEvaluationInput {
-  targetCaseNumber: string;
-  searchResults?: Array<{ caseNumber: string }> | null | undefined;
-  caseObservation?: { caseNumber: string; entries: Array<{ documents: any[] }> } | null | undefined;
-  documentObservation?: { filename: string; bytes: Buffer } | null | undefined;
-  repeatObservation?: { caseNumber: string } | null | undefined;
-  stageFailed?: 'search' | 'docket' | 'download' | 'repeat' | null | undefined;
-  error?: { code?: string; message: string } | null | undefined;
-}
-
-/**
- * Pure helper for R003-2, R003-4: Accurate Gate L1-L4 accounting and error attribution.
- */
-export function evaluateLiveGates(input: GateEvaluationInput) {
-  const gates = {
-    L1_local: 'passed (256/256 tests, CLI/HTTP/MCP, authentic corpus replay)',
-    L2_live_source_search: 'pending_operator_gate',
-    L3_live_document: 'pending_operator_gate',
-    L4_repeatability: 'pending_operator_gate',
-  };
-
-  // Evaluate Gate L2: Live Source Search & Docket
-  if (input.stageFailed === 'search') {
-    gates.L2_live_source_search = input.error?.code === 'blocked'
-      ? `blocked (${input.error.message})`
-      : `failed (search error: ${input.error?.message})`;
-    return gates;
-  }
-
-  // Check if search returned matching case (R003-2: zero matches is NOT L2 success)
-  const matches = input.searchResults || [];
-  const foundTarget = matches.some((c) => c.caseNumber && c.caseNumber.toUpperCase() === input.targetCaseNumber.toUpperCase());
-  if (!foundTarget) {
-    gates.L2_live_source_search = matches.length === 0
-      ? 'no_results (target case not found)'
-      : 'unavailable (returned different case)';
-    return gates;
-  }
-
-  if (input.stageFailed === 'docket') {
-    gates.L2_live_source_search = input.error?.code === 'blocked'
-      ? `blocked (${input.error.message})`
-      : `failed (docket error: ${input.error?.message})`;
-    return gates;
-  }
-
-  if (!input.caseObservation) {
-    gates.L2_live_source_search = 'pending_docket';
-    return gates;
-  }
-
-  // L2 is passed when matching case AND complete docket are observed
-  gates.L2_live_source_search = `passed (${input.caseObservation.entries.length} entries observed)`;
-
-  // Evaluate Gate L3: Live Document Acquisition
-  // (R003-4: document download failure must NOT erase successful L2 search!)
-  if (input.stageFailed === 'download') {
-    gates.L3_live_document = input.error?.code === 'blocked'
-      ? `blocked (${input.error.message})`
-      : `failed (${input.error?.code || 'error'}: ${input.error?.message})`;
-    return gates;
-  }
-
-  if (!input.documentObservation) {
-    gates.L3_live_document = 'pending';
-    return gates;
-  }
-
-  gates.L3_live_document = `passed (${input.documentObservation.filename}, ${input.documentObservation.bytes.length} bytes)`;
-
-  // Evaluate Gate L4: Repeatability
-  // (R003-2: single download does not satisfy L4; requires repeat observation)
-  if (input.stageFailed === 'repeat') {
-    gates.L4_repeatability = `failed (${input.error?.message})`;
-    return gates;
-  }
-
-  if (input.repeatObservation) {
-    gates.L4_repeatability = 'passed (repeat observation verified)';
-  } else {
-    gates.L4_repeatability = 'pending (repeat observation required)';
-  }
-
-  return gates;
-}
-
-/**
- * Budget enforcement context helper for R003-5
- */
-export function createLiveBudgetContext(limits: { maxRequests: number; maxBytes: number; signal?: AbortSignal }) {
-  let requestsMade = 0;
-  let bytesReceived = 0;
-
-  return {
-    signal: limits.signal,
-    get requestsMade() { return requestsMade; },
-    get bytesReceived() { return bytesReceived; },
-    async beforeRequest() {
-      limits.signal?.throwIfAborted();
-      if (requestsMade >= limits.maxRequests) {
-        throw Object.assign(new Error(`Live pilot request budget exceeded: ${limits.maxRequests}`), { code: 'budget_exceeded' });
-      }
-      requestsMade++;
-    },
-    recordBytes(bytes: number) {
-      bytesReceived += bytes;
-      if (bytesReceived > limits.maxBytes) {
-        throw Object.assign(new Error(`Live pilot byte ceiling exceeded: ${limits.maxBytes}`), { code: 'budget_exceeded' });
-      }
-    },
-  };
-}
-
-/**
- * Session verification helper for R003-6
- */
-export async function validateSessionPage(page: any, context: any) {
-  const tcModalVisible = await page.locator('#tcModalAcceptBtn').isVisible().catch(() => false);
-  const cookies = await context.cookies().catch(() => []);
-  const hasTermsCookie = cookies.some((c: any) => c.name === 'IsAcceptedTerms' || c.name.includes('Terms'));
-  const hasSessionCookie = cookies.some((c: any) => c.name === 'mcro-session' || c.name.includes('AspNetCore') || c.name === 'OClmoOot');
-  const hasSearchElements = await page.locator('#MpaCaseSearchNameTypeTab, #MpaCaseSearchCaseNumberTypeTab, #CaseSearchNumber').count().catch(() => 0) > 0;
-
-  return {
-    modalDismissed: !tcModalVisible,
-    hasTermsCookie,
-    hasSessionCookie,
-    hasSearchElements,
-    usable: !tcModalVisible && hasSearchElements && cookies.length > 0,
-    cookieCount: cookies.length,
-  };
-}
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createLiveBudgetContext, evaluateLiveGates, isLiveModeEnabled, persistVerifiedSession, validateSessionPage } from '../src/platform/live-acceptance.js';
 
 // =========================================================================
 // Tests
@@ -172,7 +33,7 @@ test('R003-2: Zero search matches does NOT satisfy Gate L2', () => {
     searchResults: [], // zero matches
   });
 
-  assert.match(result.L1_local, /^passed/);
+  assert.equal(result.L1_local, 'not evaluated in this live run');
   assert.match(result.L2_live_source_search, /^no_results/);
   assert.notEqual(result.L2_live_source_search, 'passed');
   assert.equal(result.L3_live_document, 'pending_operator_gate');
@@ -183,11 +44,10 @@ test('R003-2: Single document download does NOT satisfy Gate L4 without repeat o
   const result = evaluateLiveGates({
     targetCaseNumber: '67-CV-26-300',
     searchResults: [{ caseNumber: '67-CV-26-300' }],
-    caseObservation: { caseNumber: '67-CV-26-300', entries: [{ documents: [{ id: 'doc-1' }] }] },
-    documentObservation: { filename: 'test.pdf', bytes: Buffer.from('%PDF-1.4') },
-    // no repeat observation
+    searchComplete: true,
+    caseObservation: { caseNumber: '67-CV-26-300', complete: true, entries: [{ documents: [{ id: 'doc-1' }] }] },
+    documentObservation: { filename: 'test.pdf', bytes: 256, sha256: 'a'.repeat(64), persisted: true, extracted: true },
   });
-
   assert.match(result.L2_live_source_search, /^passed/);
   assert.match(result.L3_live_document, /^passed/);
   assert.equal(result.L4_repeatability, 'pending (repeat observation required)');
@@ -197,7 +57,8 @@ test('R003-4: A later document download failure does NOT erase successful earlie
   const result = evaluateLiveGates({
     targetCaseNumber: '67-CV-26-300',
     searchResults: [{ caseNumber: '67-CV-26-300' }],
-    caseObservation: { caseNumber: '67-CV-26-300', entries: [{ documents: [{ id: 'doc-1' }] }] },
+    searchComplete: true,
+    caseObservation: { caseNumber: '67-CV-26-300', complete: true, entries: [{ documents: [{ id: 'doc-1' }] }] },
     stageFailed: 'download',
     error: { code: 'retryable', message: 'Socket connection timed out during PDF stream' },
   });
@@ -222,12 +83,12 @@ test('R003-4: Gate L2 cleanly distinguishes typed WAF blocks from network or par
     stageFailed: 'search',
     error: { code: 'parse_error', message: 'Unexpected table schema' },
   });
-  assert.match(parseError.L2_live_source_search, /failed \(search error: Unexpected table schema\)/);
+  assert.match(parseError.L2_live_source_search, /failed \(parse_error: Unexpected table schema\)/);
   assert.doesNotMatch(parseError.L2_live_source_search, /blocked/);
 });
 
 test('R003-5: Live budget context enforces request ceiling and abort signal', async () => {
-  const budget = createLiveBudgetContext({ maxRequests: 2, maxBytes: 1000 });
+  const budget = createLiveBudgetContext({ maxRequests: 2, maxBytes: 1000, maxDocuments: 1 });
 
   await budget.beforeRequest();
   assert.equal(budget.requestsMade, 1);
@@ -255,6 +116,9 @@ test('R003-5: Live budget context enforces request ceiling and abort signal', as
       return true;
     }
   );
+  assert.equal(budget.bytesReceived, 500, 'rejected bytes must not mutate measured consumption');
+  assert.equal(budget.reserveDocument(), true);
+  assert.equal(budget.reserveDocument(), false);
 });
 
 test('R003-6: Session verification checks modal dismissal, cookies, and search accessibility', async () => {
@@ -303,18 +167,20 @@ test('R003-2: Gate L2 requires the exact target and a complete matching docket',
   const mismatchedDocket = evaluateLiveGates({
     targetCaseNumber: '67-CV-26-300',
     searchResults: [{ caseNumber: '67-CV-26-300' }],
+    searchComplete: true,
     caseObservation: { caseNumber: '27-CV-24-1', complete: true, entries: [{ documents: [] }] },
   });
-  assert.notMatch(mismatchedDocket.L2_live_source_search, /^passed/);
+  assert.doesNotMatch(mismatchedDocket.L2_live_source_search, /^passed/);
 });
 
 test('R003-2: Gate L4 rejects a repeat observation for another case', () => {
   const result = evaluateLiveGates({
     targetCaseNumber: '67-CV-26-300',
     searchResults: [{ caseNumber: '67-CV-26-300' }],
+    searchComplete: true,
     caseObservation: { caseNumber: '67-CV-26-300', complete: true, entries: [{ documents: [] }] },
-    documentObservation: { filename: 'petition.pdf', bytes: Buffer.from('%PDF-1.4\\n%%EOF') },
-    repeatObservation: { caseNumber: '27-CV-24-1' },
+    documentObservation: { filename: 'petition.pdf', bytes: 256, sha256: 'b'.repeat(64), persisted: true, extracted: true },
+    repeatObservation: { caseNumber: '27-CV-24-1', complete: true, persisted: true, recoveryVerified: true },
   });
   assert.doesNotMatch(result.L4_repeatability, /^passed/);
 });
@@ -325,4 +191,19 @@ test('R003-6: A cookie file without terms, session and usable search state is no
     { cookies: async () => [{ name: 'unrelated', value: 'synthetic' }] },
   );
   assert.equal(result.usable, false);
+});
+
+test('R003-6: Invalid session readiness cannot overwrite saved state; verified state is private', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'session-readiness-'));
+  const target = path.join(directory, 'session.json');
+  try {
+    await writeFile(target, 'previous-state', { mode: 0o600 });
+    await assert.rejects(persistVerifiedSession(target, { cookies: [] }, { usable: false }), /refusing to save/);
+    assert.equal(await readFile(target, 'utf8'), 'previous-state');
+    await persistVerifiedSession(target, { cookies: [{ name: 'synthetic' }], origins: [] }, { usable: true });
+    assert.deepEqual(JSON.parse(await readFile(target, 'utf8')), { cookies: [{ name: 'synthetic' }], origins: [] });
+    assert.equal((await stat(target)).mode & 0o777, 0o600);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -50,7 +50,7 @@ export interface CaseObservation {
   sections:Record<string,unknown>;raw:Record<string,unknown>;
 }
 export interface ArtifactObservation {bytes:Buffer;filename:string;contentType:string;sourceUrl?:string;acquiredAt:string}
-export interface AcquisitionContext {signal?:AbortSignal;beforeRequest?:()=>Promise<void>}
+export interface AcquisitionContext { signal?:AbortSignal; beforeRequest?:()=>Promise<void>; recordBytes?:(bytes:number)=>void; reserveDocument?:()=>boolean }
 export interface CourtSourceAdapter {
   metadata():SourceMetadata;
   capabilities():SourceCapabilities;

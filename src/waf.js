@@ -19,19 +19,13 @@ export async function sleepJitter(minMs = CONFIG.delays.minDelayMs, maxMs = CONF
 }
 
 /**
- * Check if Terms and Conditions dialog is visible, and accept it only if explicit consent is given.
+ * Detect the terms dialog and stop until a human has reviewed and confirmed it.
  */
 export async function ensureTermsAccepted(page) {
   try {
     const acceptBtn = page.locator('#tcModalAcceptBtn');
     const isVisible = await acceptBtn.isVisible({ timeout: 2500 });
     if (isVisible) {
-      if (process.env.COURT_AUTO_ACCEPT_TERMS === 'true') {
-        console.log('  [WAF] Terms and Conditions modal detected; accepting per COURT_AUTO_ACCEPT_TERMS=true...');
-        await acceptBtn.click();
-        await page.waitForTimeout(1000);
-        return true;
-      }
       throw Object.assign(
         new Error('Minnesota Court Records Online Terms and Conditions modal detected; operator review and confirmation required (refusing automated terms acceptance on user\'s behalf)'),
         { code: 'blocked' }

@@ -22,10 +22,8 @@ test('findSystemChrome identifies local Chrome binary or respects environment ov
   }
 });
 
-test('ensureTermsAccepted refuses automated consent by default and requires operator confirmation', async () => {
+test('ensureTermsAccepted never automates terms consent, even when the legacy opt-in is set', async () => {
   const originalAutoAccept = process.env.COURT_AUTO_ACCEPT_TERMS;
-  delete process.env.COURT_AUTO_ACCEPT_TERMS;
-
   let clicked = false;
   const mockPage = {
     locator: (selector: string) => ({
@@ -34,22 +32,16 @@ test('ensureTermsAccepted refuses automated consent by default and requires oper
     }),
     waitForTimeout: async () => {},
   };
-
   try {
-    await assert.rejects(
-      async () => ensureTermsAccepted(mockPage as any),
-      (err: any) => {
-        assert.equal(err.code, 'blocked');
-        assert.match(err.message, /refusing automated terms acceptance on user's behalf/i);
-        return true;
-      }
-    );
-    assert.equal(clicked, false, 'Terms accept button must not be clicked without authorization');
-
-    process.env.COURT_AUTO_ACCEPT_TERMS = 'true';
-    const accepted = await ensureTermsAccepted(mockPage as any);
-    assert.equal(accepted, true);
-    assert.equal(clicked, true);
+    for (const setting of [undefined, 'true']) {
+      if (setting === undefined) delete process.env.COURT_AUTO_ACCEPT_TERMS;
+      else process.env.COURT_AUTO_ACCEPT_TERMS = setting;
+      await assert.rejects(
+        async () => ensureTermsAccepted(mockPage as any),
+        (error: any) => error.code === 'blocked' && /refusing automated terms acceptance on user's behalf/i.test(error.message),
+      );
+      assert.equal(clicked, false);
+    }
   } finally {
     if (originalAutoAccept === undefined) delete process.env.COURT_AUTO_ACCEPT_TERMS;
     else process.env.COURT_AUTO_ACCEPT_TERMS = originalAutoAccept;

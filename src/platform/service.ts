@@ -36,7 +36,7 @@ export class CourtService {
   async runRetention(requestId:string,key:string){const request=await readRetentionRequest(this.pool,requestId);const job=await this.jobs.enqueue({type:'retention',payload:{requestId},idempotencyKey:keySchema.parse(key),availableAt:request.dueAt});return {jobId:job.id,status:job.status};}
   async getCaseInterpretation(caseId:string){await this.getCase(caseId);return getCaseInterpretation(this.pool,caseId);}
   async requestCaseInterpretation(caseId:string,key:string){await this.getCase(caseId);if(!caseInterpretationConfigFromEnv())throw new SourceError('unsupported','Case inference is disabled');const job=await this.jobs.enqueue({type:'interpret_case',payload:{caseId},idempotencyKey:keySchema.parse(key)});return {jobId:job.id,status:job.status};}
-  constructor(readonly pool:Pool,readonly store:ArtifactStore,readonly adapters:Map<string,CourtSourceAdapter>){this.jobs=new JobQueue(pool);}
+  constructor(readonly pool:Pool,readonly store:ArtifactStore,readonly adapters:Map<string,CourtSourceAdapter>,private readonly liveBudget?:{beforeRequest:()=>Promise<void>;recordBytes:(bytes:number)=>void;reserveDocument:()=>boolean}){this.jobs=new JobQueue(pool);}
   private async fence(client:PoolClient,job:Job):Promise<void>{
     const lease=await client.query("SELECT 1 FROM jobs WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_expires_at>clock_timestamp() FOR UPDATE",[job.id,job.leaseToken]);
     if(!lease.rowCount)throw new SourceError('permanent','Job lease lost or cancelled before persistence');
@@ -448,7 +448,7 @@ export class CourtService {
       if(result.status!=='complete')throw new SourceError('unsupported','Case inference is disabled');
       return {status:'complete',result:{runId:result.id}};
     }
-    const context={...(signal?{signal}:{}),...(job.sourceId?{beforeRequest:()=>this.reserveSourceRequest(job.sourceId!,signal)}:{})};
+    const context={...(signal?{signal}:{}),...(job.sourceId?{beforeRequest:async()=>{await this.reserveSourceRequest(job.sourceId!,signal);await this.liveBudget?.beforeRequest();}}:{}),...(this.liveBudget?{recordBytes:(bytes:number)=>this.liveBudget!.recordBytes(bytes),reserveDocument:()=>this.liveBudget!.reserveDocument()}:{})};
     if(job.type==='refresh_request'){
       const caseId=id.parse(job.payload['caseId']);
       const child=await transaction(this.pool,async client=>{
@@ -506,7 +506,9 @@ export class CourtService {
       const observation=await this.adapter(job.sourceId).fetchCase(z.string().parse(job.payload['sourceCaseId']),context);
       if(observation.sourceId!==job.sourceId)throw new SourceError('parse_error','Docket source identity mismatch');
       const saved=await reconcileObservation(this.pool,observation,client=>this.fence(client,job));const children:string[]=[];
+      let budgetLimitedDocuments=0;
       for(const documentId of saved.documents){
+        if(context.reserveDocument&&!context.reserveDocument()){budgetLimitedDocuments++;continue;}
         const child=await this.enqueueChild(job,{type:'download_artifact',sourceId:job.sourceId,payload:{documentId,caseId:saved.caseId},idempotencyKey:`snapshot:${saved.snapshotId}:${documentId}`});
         children.push(child.id);
       }
@@ -514,13 +516,13 @@ export class CourtService {
         await this.fence(client,job);
         await scheduleNextRefresh(client,saved.caseId);
       });
-      return {status:saved.complete?'complete':'partial',result:{caseId:saved.caseId,snapshotId:saved.snapshotId,acquisitionStatus:children.length?'partial':saved.complete?'complete':'partial',childJobIds:children}};
+      return {status:saved.complete&&!budgetLimitedDocuments?'complete':'partial',result:{caseId:saved.caseId,snapshotId:saved.snapshotId,acquisitionStatus:children.length||budgetLimitedDocuments?'partial':saved.complete?'complete':'partial',childJobIds:children,budgetLimitedDocuments}};
     }
     if(job.type==='download_artifact'){
       const documentId=id.parse(job.payload['documentId']);
       const row=(await this.pool.query<{reference:DocumentReference;case_id:string;source_id:string}>("SELECT d.reference,d.case_id,c.source_id FROM documents d JOIN cases c ON c.id=d.case_id WHERE d.id=$1 AND d.availability='available' AND c.availability='public'",[documentId])).rows[0];
       if(!row)throw new SourceError('restricted','Document no longer available');
-      const artifact=await this.adapter(row.source_id).fetchDocument(row.reference,context);signal?.throwIfAborted();
+      const artifact=await this.adapter(row.source_id).fetchDocument(row.reference,context);signal?.throwIfAborted();context.recordBytes?.(artifact.bytes.length);
       const versionId=await this.persistArtifact(documentId,artifact.bytes,artifact.filename,artifact.contentType,artifact.sourceUrl??null,artifact.acquiredAt,job);
       const processJob=await this.enqueueChild(job,{type:'process_document',payload:{documentVersionId:versionId,caseId:row.case_id},idempotencyKey:this.processingKey(versionId)});
       return {status:'complete',result:{documentVersionId:versionId,childJobIds:[processJob.id]}};

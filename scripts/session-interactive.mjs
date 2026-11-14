@@ -5,6 +5,7 @@ import os from 'node:os';
 import readline from 'node:readline';
 import { findSystemChrome } from '../dist/src/browser.js';
 import { CONFIG } from '../dist/src/config.js';
+import { persistVerifiedSession, validateSessionPage } from '../src/platform/live-acceptance.js';
 
 const sessionPath = process.env.COURT_SESSION_FILE || CONFIG.sessionFile || path.join(os.homedir(), '.mcro-puller', 'session.json');
 
@@ -103,26 +104,6 @@ export function importSessionFile(sourcePath, targetPath = sessionPath) {
   return getSessionStatus(targetPath);
 }
 
-/**
- * Validates observed page state after human action (R003-6).
- * Checks that terms modal was dismissed, search elements are accessible, and session cookies are present.
- */
-export async function validateSessionPage(page, context) {
-  const tcModalVisible = await page.locator('#tcModalAcceptBtn').isVisible().catch(() => false);
-  const cookies = await context.cookies().catch(() => []);
-  const hasTermsCookie = cookies.some((c) => c.name === 'IsAcceptedTerms' || c.name.includes('Terms'));
-  const hasSessionCookie = cookies.some((c) => c.name === 'mcro-session' || c.name.includes('AspNetCore') || c.name === 'OClmoOot');
-  const hasSearchElements = await page.locator('#MpaCaseSearchNameTypeTab, #MpaCaseSearchCaseNumberTypeTab, #CaseSearchNumber').count().catch(() => 0) > 0;
-
-  return {
-    modalDismissed: !tcModalVisible,
-    hasTermsCookie,
-    hasSessionCookie,
-    hasSearchElements,
-    usable: !tcModalVisible && hasSearchElements && cookies.length > 0,
-    cookieCount: cookies.length,
-  };
-}
 
 export async function runInteractiveSession(options = {}) {
   const targetPath = options.sessionPath || sessionPath;
@@ -211,21 +192,16 @@ export async function runInteractiveSession(options = {}) {
       return;
     }
 
-    // Validate page state before claiming verified session (R003-6)
+    // A saved file is not evidence of a usable browser session. Require the
+    // operator's action to leave both required cookies and search controls ready.
     const validation = await validateSessionPage(page, context);
-    if (!validation.modalDismissed) {
-      console.warn(`\n[WARNING] Terms and Conditions modal is still visible in the browser window!`);
-      console.warn(`Saving session anyway, but subsequent headless runs may still require operator confirmation.`);
-    } else {
-      console.log(`\n[Verified] Terms modal dismissed and search elements are accessible.`);
+    if (!validation.usable) {
+      throw new Error(`Session is not ready; no state saved (terms cookie=${validation.hasTermsCookie}, session cookie=${validation.hasSessionCookie}, search controls=${validation.hasSearchElements}, terms modal dismissed=${validation.modalDismissed})`);
     }
+    console.log(`\n[Verified] Terms modal dismissed; terms/session cookies and search elements are present.`);
 
-    // Save storage state with mode 0600
-    const dir = path.dirname(targetPath);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-
-    await context.storageState({ path: targetPath });
-    chmodSync(targetPath, 0o600);
+    const storageState = await context.storageState();
+    await persistVerifiedSession(targetPath, storageState, validation);
 
     const status = getSessionStatus(targetPath);
     console.log(`\n======================================================`);
