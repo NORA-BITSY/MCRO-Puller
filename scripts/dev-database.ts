@@ -1,5 +1,5 @@
 import EmbeddedPostgres from 'embedded-postgres';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 const root=path.resolve('.runtime');
@@ -13,7 +13,11 @@ catch(error){
   await writeFile(credentialFile,JSON.stringify(credentials),{mode:0o600,flag:'wx'});
 }
 const database=new EmbeddedPostgres({databaseDir:path.join(root,'postgres'),user:'court',password:credentials.password,port:credentials.port,persistent:true,authMethod:'scram-sha-256',postgresFlags:['-h','127.0.0.1','-k',root],onLog:()=>{},onError:message=>console.error(String(message))});
-await database.initialise();
+try { await access(path.join(root,'postgres','PG_VERSION')); }
+catch(error){
+  if(!(error instanceof Error && 'code' in error && error.code==='ENOENT'))throw error;
+  await database.initialise();
+}
 await database.start();
 const client=database.getPgClient();await client.connect();
 if(!(await client.query("SELECT 1 FROM pg_database WHERE datname='court_dev'")).rowCount)await client.query('CREATE DATABASE court_dev');

@@ -340,3 +340,41 @@ test('MCP watch and policy operations use the real database and enforce role vis
     }
   }
 });
+
+test('capped discovery persists bounded splits and irreducible gaps across scheduler restart', { skip: !url }, async t => {
+  const { pool, service, store, adapters } = await setup(t);
+  class Saturated extends IndependentFixtureAdapter {
+    override async searchCases(...args: Parameters<IndependentFixtureAdapter['searchCases']>) {
+      const observed = await super.searchCases(...args);
+      return { ...observed, complete: false, truncated: true, limitations: ['Synthetic source result cap'] };
+    }
+  }
+  adapters.set('independent-fixture', new Saturated());
+  const plan = await service.planDiscovery({ sourceId: 'independent-fixture', searchType: 'business', businessName: 'Example*',
+    filedFrom: '2024-01-01', filedTo: '2024-01-02', acquireResults: false }) as { partitionId: string };
+  await service.scheduleDue();
+  const parent = await service.jobs.claim('capped-parent'); assert.ok(parent?.leaseToken);
+  const result = await service.executeJob(parent);
+  assert.equal(result.status, 'partial');
+  assert.equal(await service.jobs.complete(parent.id, parent.leaseToken, result.result, result.status), true);
+  const children = (await pool.query("SELECT id,query,status FROM discovery_partitions WHERE parent_id=$1 ORDER BY query->>'filedFrom'", [plan.partitionId])).rows;
+  assert.deepEqual(children.map(row => [row.query.filedFrom, row.query.filedTo, row.status]), [
+    ['2024-01-01', '2024-01-01', 'pending'], ['2024-01-02', '2024-01-02', 'pending'],
+  ]);
+  const restarted = new CourtService(pool, store, adapters);
+  await restarted.scheduleDue();
+  for (const child of children) {
+    const job = await restarted.jobs.claim(`capped-${child.id}`); assert.ok(job?.leaseToken);
+    const observation = await restarted.executeJob(job);
+    assert.equal(observation.status, 'partial');
+    await restarted.jobs.complete(job.id, job.leaseToken, observation.result, observation.status);
+  }
+  assert.deepEqual((await pool.query('SELECT status,next_run_at FROM discovery_partitions ORDER BY parent_id NULLS FIRST,id')).rows,
+    [{ status: 'split', next_run_at: null }, { status: 'saturated', next_run_at: null }, { status: 'saturated', next_run_at: null }]);
+  assert.deepEqual((await pool.query("SELECT status,denominator FROM coverage_observations WHERE dimension='discovery' ORDER BY id")).rows,
+    Array.from({ length: 3 }, () => ({ status: 'truncated', denominator: null })));
+  const cases = (await pool.query('SELECT source_case_id,next_refresh_at FROM cases')).rows;
+  assert.deepEqual(cases, [{ source_case_id: 'civil:alpha/2024', next_refresh_at: null }]);
+  assert.deepEqual(await restarted.scheduleDue(), { scheduled: 0, jobIds: [] });
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM jobs')).rows[0].count, 3);
+});
