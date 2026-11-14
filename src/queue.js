@@ -1,121 +1,122 @@
 import { CONFIG } from './config.js';
 import { createBrowserClient } from './browser.js';
 import { crawlCase } from './crawler.js';
+import { safeCaseNumber } from './downloader.js';
+import { loadState, updateState } from './state.js';
 import { sleepJitter } from './waf.js';
 
 export class WorkerQueue {
   constructor(options = {}) {
-    this.concurrency = Number.isInteger(options.concurrency) && options.concurrency > 0 ? options.concurrency : 1;
-    this.proxyManager = options.proxyManager || null;
-    this.mode = options.mode || (this.proxyManager && this.proxyManager.proxies.length > 0 ? 'standalone' : 'extension');
+    // This legacy queue has one source. Never overlap requests or rotate identities
+    // after a challenge; distributed multi-source concurrency belongs to platform jobs.
+    this.concurrency = 1;
+    this.mode = options.mode || 'extension';
     this.headed = options.headed || false;
     this.outputDir = options.outputDir || CONFIG.outputDir;
+    this.stateFile = options.stateFile || CONFIG.stateFile;
     this.force = options.force || false;
-
-    this.queue = [];
+    this.createClient = options.createBrowserClient || createBrowserClient;
+    this.crawl = options.crawlCase || crawlCase;
+    const previous = loadState(this.stateFile).queue;
+    this.queue = options.resume !== false && previous?.outputDir === this.outputDir ? [...new Set(previous.pending || [])] : [];
     this.activeWorkers = 0;
     this.isStopping = false;
     this.completedCount = 0;
     this.failedCount = 0;
-
+    this.retryCases = [];
+    this.inFlight = [];
+    this.status = 'pending';
+    this.results = [];
+    this.signalHandlers = new Map();
     this.registerSignalHandlers();
   }
 
   registerSignalHandlers() {
-    const handleExit = async (signal) => {
-      if (this.isStopping) return;
-      console.log(`\n[Queue] Received ${signal}. Initiating graceful shutdown...`);
-      this.isStopping = true;
-      this.queue = []; // clear remaining jobs
-    };
-
-    process.once('SIGINT', () => handleExit('SIGINT'));
-    process.once('SIGTERM', () => handleExit('SIGTERM'));
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      const handler = () => {
+        this.isStopping = true;
+        if (this.status !== 'blocked') this.status = 'stopped';
+        this.persist().catch((error) => { console.error(`[Queue] Could not persist shutdown state: ${error.message}`); process.exitCode = 1; });
+      };
+      this.signalHandlers.set(signal, handler);
+      process.once(signal, handler);
+    }
   }
 
   addCase(caseNumber) {
-    this.queue.push(caseNumber);
+    const normalized = safeCaseNumber(caseNumber);
+    if (!this.queue.includes(normalized) && !this.inFlight.includes(normalized)) this.queue.push(normalized);
   }
 
   addCases(caseNumbers) {
-    this.queue.push(...caseNumbers);
+    for (const caseNumber of caseNumbers) this.addCase(caseNumber);
+  }
+
+  pending() { return [...new Set([...this.retryCases, ...this.inFlight, ...this.queue])]; }
+
+  async persist() {
+    const queue = { sourceId: 'mn-mcro', outputDir: this.outputDir, status: this.status,
+      pending: this.pending(), inFlight: [...this.inFlight], succeeded: this.completedCount,
+      failed: this.failedCount, updatedAt: new Date().toISOString() };
+    await updateState((state) => { state.queue = queue; }, this.stateFile);
   }
 
   async run() {
-    console.log(
-      `[Queue] Starting processing with ${this.concurrency} worker(s) across ${this.queue.length} case(s) (mode: ${this.mode})...`
-    );
-
-    const workers = [];
-    for (let i = 0; i < this.concurrency; i++) {
-      workers.push(this.spawnWorker(i + 1));
+    this.status = this.isStopping ? this.status : 'running';
+    try {
+      await this.persist();
+      await this.spawnWorker(1);
+      if (!this.isStopping) this.status = this.failedCount ? 'partial' : 'complete';
+      await this.persist();
+      return { succeeded: this.completedCount, failed: this.failedCount, stopped: this.isStopping,
+        status: this.status, pending: this.pending(), results: this.results, concurrency: this.concurrency };
+    } finally {
+      for (const [signal, handler] of this.signalHandlers) process.removeListener(signal, handler);
+      this.signalHandlers.clear();
     }
-
-    await Promise.all(workers);
-    const summary = {
-      succeeded: this.completedCount,
-      failed: this.failedCount,
-      stopped: this.isStopping,
-    };
-    console.log(`[Queue] All workers completed: ${summary.succeeded} succeeded, ${summary.failed} failed.`);
-    return summary;
   }
 
   async spawnWorker(workerId) {
-    while (this.queue.length > 0 && !this.isStopping) {
+    while (this.queue.length && !this.isStopping) {
       const caseNumber = this.queue.shift();
-      if (!caseNumber) break;
-
-      let proxy = null;
-      if (this.proxyManager && this.proxyManager.proxies.length > 0) {
-        proxy = this.proxyManager.getNextAvailableProxy();
-        if (!proxy) {
-          this.failedCount++;
-          console.error(`[Worker ${workerId}] No healthy proxy is available; stopping rather than falling back to the direct IP.`);
-          this.isStopping = true;
-          break;
-        }
-      }
-
-      console.log(`[Worker ${workerId}] Processing case: ${caseNumber} (proxy: ${proxy ? proxy.server : 'direct'})`);
-
+      this.inFlight.push(caseNumber);
+      this.activeWorkers++;
+      await this.persist();
       let client;
       try {
-        client = await createBrowserClient({
-          mode: this.mode,
-          headed: this.headed,
-          proxy: this.proxyManager ? this.proxyManager.toPlaywrightProxy(proxy) : undefined,
-        });
-
-        const res = await crawlCase(client, caseNumber, {
-          outputDir: this.outputDir,
-          force: this.force,
-        });
-
-        if (res.success) {
-          this.completedCount++;
-          if (this.proxyManager && proxy) {
-            this.proxyManager.reportSuccess(proxy);
-          }
-        } else {
-          this.failedCount++;
+        client = await this.createClient({ mode: this.mode, headed: this.headed });
+        if (this.isStopping) {
+          this.retryCases.push(caseNumber);
+          continue;
         }
-      } catch (err) {
+        const result = await this.crawl(client, caseNumber, { outputDir: this.outputDir, stateFile: this.stateFile, force: this.force });
+        this.results.push({ caseNumber, ...result });
+        if (result.success && (!result.status || result.status === 'complete')) this.completedCount++;
+        else {
+          this.failedCount++;
+          this.retryCases.push(caseNumber);
+          if (result.status === 'blocked' || result.code === 'blocked' || result.summary?.status === 'blocked') {
+            this.isStopping = true;
+            this.status = 'blocked';
+          }
+        }
+      } catch (error) {
         this.failedCount++;
-        console.error(`[Worker ${workerId}] Error processing case ${caseNumber}: ${err.message}`);
-        if (this.proxyManager && proxy) {
-          this.proxyManager.reportFailure(proxy, err.message);
+        this.retryCases.push(caseNumber);
+        this.results.push({ caseNumber, success: false, status: error.code === 'blocked' ? 'blocked' : 'error', error: error.message });
+        if (error.code === 'blocked') {
+          this.isStopping = true;
+          this.status = 'blocked';
         }
       } finally {
         if (client) {
-          await client.close().catch(() => {});
+          try { await client.close(); } catch (error) { console.error(`[Worker ${workerId}] Browser cleanup failed: ${error.message}`); }
         }
+        this.inFlight = this.inFlight.filter((value) => value !== caseNumber);
+        this.activeWorkers--;
+        await this.persist();
       }
-
-      if (!this.isStopping && this.queue.length > 0) {
-        const jitter = await sleepJitter();
-        console.log(`[Worker ${workerId}] Pausing ${Math.round(jitter / 1000)}s before next job...`);
-      }
+      if (!this.isStopping && this.queue.length) await sleepJitter();
     }
   }
 }

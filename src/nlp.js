@@ -17,22 +17,58 @@ function writeJsonAtomic(filePath, value) {
  * Classify document type from text and title.
  */
 export function classifyDocumentType(text, filename = '') {
-  const upper = (text.slice(0, 4000) + ' ' + filename).toUpperCase();
+  return classifyDocumentHeading(text, filename).label;
+}
 
-  if (upper.includes('AFFIDAVIT OF SERVICE') || upper.includes('CERTIFICATE OF SERVICE')) return 'AFFIDAVIT_OF_SERVICE';
-  if (upper.includes('CIVIL COVER SHEET')) return 'CIVIL_COVER_SHEET';
-  if (upper.includes('NOTICE OF CASE FILING')) return 'NOTICE_OF_CASE_FILING';
-  if (upper.includes('NOTICE OF DEFICIENCY')) return 'NOTICE_OF_DEFICIENCY';
-  if (upper.includes('ANSWER')) return 'ANSWER';
-  if (upper.includes('MOTION')) return 'MOTION';
-  if (upper.includes('ORDER')) return 'ORDER';
-  if (upper.includes('JUDGMENT')) return 'JUDGMENT';
-  if (upper.includes('SUMMONS AND COMPLAINT')) return 'SUMMONS_AND_COMPLAINT';
-  if (upper.includes('SUMMONS')) return 'SUMMONS';
-  if (upper.includes('COMPLAINT') || upper.includes('PETITION')) return 'COMPLAINT';
-  if (upper.includes('AFFIDAVIT')) return 'AFFIDAVIT';
-  if (upper.includes('NOTICE')) return 'NOTICE';
-  return 'OTHER';
+const DOCUMENT_FAMILIES = {
+  AFFIDAVIT_OF_SERVICE: 'AFFIDAVIT', CIVIL_COVER_SHEET: 'ADMINISTRATIVE',
+  NOTICE_OF_CASE_FILING: 'NOTICE', NOTICE_OF_DEFICIENCY: 'NOTICE',
+  SUMMONS_AND_COMPLAINT: 'PLEADING', COMPLAINT: 'PLEADING', ANSWER: 'PLEADING',
+  SUMMONS: 'NOTICE',
+};
+
+export function classifyDocumentHeading(text, filename = '') {
+  /** @type {Array<[string, RegExp]>} */
+  const rules = [
+    ['AFFIDAVIT_OF_SERVICE', /^(?:AFFIDAVIT|CERTIFICATE) OF SERVICE\b/],
+    ['CIVIL_COVER_SHEET', /^CIVIL COVER SHEET\b/],
+    ['NOTICE_OF_CASE_FILING', /^NOTICE OF CASE FILING\b/],
+    ['NOTICE_OF_DEFICIENCY', /^NOTICE OF DEFICIENCY\b/],
+    ['SUMMONS_AND_COMPLAINT', /^SUMMONS AND COMPLAINT\b/],
+    ['ANSWER', /^(?:(?:DEFENDANT|RESPONDENT)(?:'S|S')?\s+)?ANSWER\b/],
+    ['MOTION', /^(?:(?:PLAINTIFF|DEFENDANT)(?:'S|S')?\s+)?MOTION\b/],
+    ['ORDER', /^(?:PROPOSED\s+)?ORDER\b/],
+    ['JUDGMENT', /^JUDGMENT\b/],
+    ['SUMMONS', /^SUMMONS\b/],
+    ['COMPLAINT', /^(?:(?:FIRST|SECOND|THIRD|VERIFIED|AMENDED)\s+)*(?:COMPLAINT|PETITION)\b/],
+    ['AFFIDAVIT', /^AFFIDAVIT\b/],
+    ['DECLARATION', /^DECLARATION\b/],
+    ['RESPONSE', /^(?:(?:PLAINTIFF|DEFENDANT|RESPONDENT|PETITIONER)(?:'S|S')?\s+)?(?:RESPONSE|REPLY|OPPOSITION)\b/],
+    ['EXHIBIT', /^(?:EXHIBIT|ATTACHMENT)\b/],
+    ['TRANSCRIPT', /^(?:(?:CERTIFIED|OFFICIAL)\s+)?TRANSCRIPT\b/],
+    ['CORRESPONDENCE', /^(?:CORRESPONDENCE|LETTER)\b/],
+    ['NOTICE', /^NOTICE\b/],
+  ];
+  const lines = text.slice(0, 6000).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (line.length > 160 || /[.!?]\s+\S/.test(line) || /[,;]$/.test(line)) continue;
+    // Wrapped caption/prose lines such as "complaint herein," are not headings.
+    // Accept uppercase or title-case words, allowing ordinary title connectors.
+    if (!line.split(/\s+/).every(word => !/[A-Za-z]/.test(word) ||
+      /^[^A-Za-z]*[A-Z]/.test(word) || /^(?:a|an|and|as|at|by|for|from|in|of|on|or|the|to|under|with)$/i.test(word))) continue;
+    for (const [label, pattern] of rules) {
+      if (pattern.test(line.toUpperCase())) return { label, family: DOCUMENT_FAMILIES[label] ?? label, evidence: line, confidence: 0.9 };
+    }
+  }
+  // Source filenames commonly prefix the title with a portal and case identifier.
+  // Underscore-separated metadata is weaker evidence than a recognized heading.
+  const hints = path.basename(filename).replace(/\.pdf$/i, '').split('_').map(part => part.replace(/-/g, ' ').toUpperCase());
+  for (const hint of hints) {
+    for (const [label, pattern] of rules) {
+      if (pattern.test(hint)) return { label, family: DOCUMENT_FAMILIES[label] ?? label, evidence: filename, confidence: 0.5 };
+    }
+  }
+  return { label: 'OTHER', family: 'OTHER', evidence: '', confidence: 0 };
 }
 
 /**
@@ -299,10 +335,16 @@ export function synthesizeCaseDossier(caseDir) {
   });
   dossier.roster.parties = Array.isArray(indexData.parties) ? indexData.parties : [];
 
-  const files = fs.readdirSync(caseDir);
-  const jsonDossiers = files.filter((f) => f.endsWith('.dossier.json'));
+  const manifestDocuments = Array.isArray(indexData.documents)
+    ? indexData.documents : (Array.isArray(indexData.downloaded) ? indexData.downloaded : []);
+  const jsonDossiers = new Set(manifestDocuments
+    .filter(document => document.filename && document.status !== 'removed' && document.status !== 'failed')
+    .map(document => document.filename)
+    .filter(filename => path.basename(filename) === filename && /\.pdf$/i.test(filename))
+    .map(filename => filename.replace(/\.pdf$/i, '.dossier.json')));
 
   for (const filename of jsonDossiers) {
+    if (!fs.existsSync(path.join(caseDir, filename))) continue;
     const dossierPath = path.join(caseDir, filename);
     let filing;
     try {

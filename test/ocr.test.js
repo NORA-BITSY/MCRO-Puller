@@ -55,3 +55,23 @@ test('OCR preprocessing uses the PDF page count and emits provenance metadata', 
   assert.equal(fs.existsSync(path.join(directory, 'filing.txt')), true);
   assert.equal(fs.existsSync(path.join(directory, 'filing.dossier.json')), true);
 });
+
+test('malformed PDF fails explicitly rather than becoming a blank document', { skip: !hasPoppler }, (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mcro-invalid-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, 'bad.pdf');
+  fs.writeFileSync(filename, '%PDF-1.4\nnot a PDF');
+  assert.throws(() => preprocessPdf(filename), /PDF|pdfinfo|page count/);
+});
+
+test('successful empty OCR is distinguished from extraction failure', {
+  skip: !hasPoppler || !['pdftoppm', 'tesseract'].every((binary) => spawnSync(binary, ['-v']).status === 0),
+}, (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mcro-blank-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, 'blank.pdf');
+  fs.writeFileSync(filename, createPdf(''));
+  const result = preprocessPdf(filename);
+  assert.equal(result.pages[0].source, 'blank');
+  assert.equal(result.pages[0].quality.status, 'blank');
+});

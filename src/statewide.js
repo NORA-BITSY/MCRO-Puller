@@ -1,6 +1,6 @@
 import { CONFIG } from './config.js';
 import { COUNTIES } from './counties.js';
-import { searchCases } from './search.js';
+import { executeSearch, validateSearchOptions } from './search.js';
 import { crawlCase } from './crawler.js';
 import { loadState } from './state.js';
 import { sleepJitter } from './waf.js';
@@ -11,6 +11,16 @@ export const CASE_CATEGORIES = [
   { code: 'FAM', name: 'Family' },
   { code: 'PR', name: 'Probate/Mental Health' },
 ];
+
+export function validateDiscoveryQuery(query) {
+  if (!query) throw Object.assign(new Error('Filter-only statewide discovery is unsupported: supply a documented, validated source query; no wildcard or name-free enumeration is assumed'), { code: 'unsupported' });
+  const validated = validateSearchOptions(query);
+  if (!['party', 'business', 'attorney'].includes(validated.searchType)) throw Object.assign(new Error('County/category/filing-date partitions require a person, business, or attorney query'), { code: 'unsupported' });
+  for (const key of ['county', 'counties', 'categories', 'status', 'filedFrom', 'filedTo']) {
+    if (validated[key] !== undefined) throw Object.assign(new Error(`Use partition options for ${key}; discovery will not silently replace a query filter`), { code: 'permanent' });
+  }
+  return validated;
+}
 
 /**
  * Generate county/category/date slices. Capped slices are bisected later.
@@ -36,6 +46,7 @@ export function generatePartitions(options = {}) {
         filedDateFrom: dateFrom,
         filedDateTo: dateTo,
         caseStatus: status,
+        query: options.query,
       });
     }
   }
@@ -52,15 +63,17 @@ function formatDate(date) {
   return date.toISOString().slice(0, 10);
 }
 
-export async function discoverPartition(page, partition, maxCasesPerSlice = 200, search = searchCases) {
-  const result = await search(page, {
+export async function discoverPartition(page, partition, maxCasesPerSlice = 200, search = executeSearch) {
+  const criterion = validateDiscoveryQuery(partition.query);
+  const query = validateSearchOptions({
+    ...criterion,
     counties: [partition.county],
     categories: [partition.category],
-    caseStatus: partition.caseStatus,
-    filedDateFrom: partition.filedDateFrom,
-    filedDateTo: partition.filedDateTo,
-    filedDateExact: false,
+    status: partition.caseStatus,
+    ...(partition.filedDateFrom ? { filedFrom: partition.filedDateFrom } : {}),
+    ...(partition.filedDateTo ? { filedTo: partition.filedDateTo } : {}),
   });
+  const result = await search(page, query);
 
   if (!result.truncated && result.cases.length < maxCasesPerSlice) return result.cases;
 
@@ -89,10 +102,11 @@ export async function discoverPartition(page, partition, maxCasesPerSlice = 200,
 
 
 /**
- * Autonomous Statewide Discovery & Crawler.
- * Iterates through partitioned slices, discovers all active cases, and downloads documents.
+ * County-partitioned discovery for one validated source query.
+ * Uncapped slices are not a claim of complete statewide public-record coverage.
  */
 export async function crawlStatewideActiveCases(browserClient, options = {}) {
+  validateDiscoveryQuery(options.query);
   const partitions = generatePartitions(options);
   console.log(`\n======================================================`);
   console.log(`[Statewide Crawler] Generated ${partitions.length} partition slices.`);
@@ -118,7 +132,7 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
     } catch (err) {
       console.error(`  [Partition Error] Failed to search partition: ${err.message}`);
       partitionFailures.push({ partition: part, error: err.message });
-      if (err.message.includes('[WAF BLOCKED]')) throw err;
+      if (['blocked', 'unsupported', 'permanent'].includes(err.code)) throw err;
       await sleepJitter();
       continue;
     }
@@ -148,7 +162,7 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
       } catch (err) {
         console.error(`  [Case Error] Failed pulling ${caseNo}: ${err.message}`);
         caseFailures.push({ caseNumber: caseNo, error: err.message });
-        if (err.message.includes('[WAF BLOCKED]')) throw err;
+        if (err.code === 'blocked') throw err;
       }
 
       // Jitter pause between cases

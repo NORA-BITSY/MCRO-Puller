@@ -1,0 +1,29 @@
+{
+  "format": "independent-fixture/1",
+  "description": "Synthetic portability dataset, not court records or evidence of another state's portal. PDF attachments are generated valid test documents.",
+  "pageSize": 2,
+  "records": [
+    {
+      "recordId": "civil:alpha/2024", "displayNumber": "FX-2024-0001", "caption": "Example Alpha LLC v. Jane Doe", "tribunal": "Fixture North Tribunal", "region": "North", "lifeCycle": "Active", "category": "CV", "filedOn": "2024-01-01", "citation": "FIXTURE-101",
+      "people": [{"name": "Jane Doe", "given": "Jane", "family": "Doe", "middle": "A", "born": "1980-04-01", "role": "Respondent"}],
+      "organizations": ["Example Alpha LLC"], "lawyers": [{"given": "Alex", "family": "Smith", "middle": "B", "bar": "0123456"}],
+      "hearings": [{"date": "2025-01-02", "judge": "Example Judge", "label": "Scheduling Conference", "outcome": "Continued"}],
+      "judgments": [{"docketed": "2024-06-01", "status": "Unsatisfied", "debtor": "Jane Doe", "amount": "125.00"}],
+      "ledger": [
+        {"eventId": "evt:hearing-9", "when": "2025-01-02", "label": "Proceeding held; continued", "attachments": [], "rawLabel": "Session outcome"},
+        {"eventId": "evt:filing-2", "when": "2024-01-03", "label": "Petition with supporting exhibit", "rawLabel": "Submission / Enclosures", "attachments": [{"assetId": "asset:petition-A", "title": "Petition", "file": "petition.pdf", "access": "available"}, {"assetId": "asset:exhibit-B", "title": "Exhibit A", "file": "exhibit.pdf", "access": "available"}]},
+        {"eventId": "evt:opened-1", "when": "2024-01-01", "label": "Matter opened", "attachments": [], "rawLabel": "Administrative event"}
+      ]
+    },
+    {
+      "recordId": "commercial:beta/2024", "displayNumber": "FX-2024-0002", "caption": "Example Beta Inc. v. Jane Doe", "tribunal": "Fixture South Tribunal", "region": "South", "lifeCycle": "Inactive", "category": "CV", "filedOn": "2024-02-01", "citation": "FIXTURE-102",
+      "people": [{"name": "Jane Doe", "given": "Jane", "family": "Doe", "born": "1980-04-01", "role": "Debtor"}], "organizations": ["Example Beta Inc."], "lawyers": [], "hearings": [],
+      "judgments": [{"docketed": "2024-06-02", "status": "Satisfied", "debtor": "Jane Doe", "amount": "250.00"}],
+      "ledger": [{"eventId": "evt:closed-7", "when": "2024-06-02", "label": "Judgment satisfied", "attachments": [], "rawLabel": "Satisfaction"}]
+    },
+    {
+      "recordId": "appeal:gamma/2024", "displayNumber": "FX-2024-0003", "caption": "Example Gamma Ltd. appeal", "tribunal": "Fixture Review Tribunal", "region": "North", "lifeCycle": "Active", "category": "CV", "filedOn": "2024-03-01", "citation": "FIXTURE-103", "people": [], "organizations": ["Example Gamma Ltd."], "lawyers": [], "hearings": [], "judgments": [],
+      "ledger": [{"eventId": "review:restricted-2", "when": "2024-03-02", "label": "Restricted attachment listed", "attachments": [{"assetId": "restricted:C", "title": "Restricted filing", "access": "restricted"}], "rawLabel": "Attachment withheld by source"}]
+    }
+  ]
+}

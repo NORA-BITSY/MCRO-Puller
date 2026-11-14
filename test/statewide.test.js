@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { discoverPartition, generatePartitions } from '../src/statewide.js';
+import { discoverPartition, generatePartitions, validateDiscoveryQuery } from '../src/statewide.js';
 
 test('partition generation covers each county/category combination', () => {
   const partitions = generatePartitions({
@@ -16,16 +16,17 @@ test('partition generation covers each county/category combination', () => {
 
 test('capped date ranges are bisected until each search is uncapped', async () => {
   const search = async (_page, options) => {
-    if (options.filedDateFrom !== options.filedDateTo) {
+    if (options.filedFrom !== options.filedTo) {
       return { truncated: true, cases: [{ caseNumber: 'cap-a' }, { caseNumber: 'cap-b' }] };
     }
     return {
       truncated: false,
-      cases: [{ caseNumber: `case-${options.filedDateFrom}` }],
+      cases: [{ caseNumber: `case-${options.filedFrom}` }],
     };
   };
 
   const cases = await discoverPartition(null, {
+    query: { searchType: 'party', lastName: 'Doe', firstName: 'Jane' },
     county: 'Hennepin',
     category: 'CV',
     caseStatus: '1',
@@ -49,6 +50,7 @@ test('a saturated one-day partition fails instead of claiming completeness', asy
 
   await assert.rejects(
     discoverPartition(null, {
+      query: { searchType: 'party', lastName: 'Doe', firstName: 'Jane' },
       county: 'Hennepin',
       category: 'CV',
       caseStatus: '1',
@@ -57,4 +59,18 @@ test('a saturated one-day partition fails instead of claiming completeness', asy
     }, 2, search),
     /cannot be split further/
   );
+});
+
+test('filter-only statewide discovery fails before searching and does not invent a wildcard', async () => {
+  let searched = false;
+  await assert.rejects(discoverPartition(null, {
+    county: 'Hennepin', category: 'CV', caseStatus: '1', filedDateFrom: '2025-01-01', filedDateTo: '2025-01-02',
+  }, 200, async () => { searched = true; return { cases: [] }; }), { code: 'unsupported' });
+  assert.equal(searched, false);
+});
+
+test('discovery never overwrites user filters or applies date partitions to an incompatible mode', () => {
+  assert.throws(() => validateDiscoveryQuery({ searchType: 'case', caseNumber: '27-CV-24-1' }), { code: 'unsupported' });
+  assert.throws(() => validateDiscoveryQuery({ searchType: 'party', firstName: 'Jane', lastName: 'Doe', counties: ['Hennepin'] }), /counties/);
+  assert.throws(() => validateDiscoveryQuery({ searchType: 'business', businessName: 'Example', filedFrom: '2025-01-01' }), /filedFrom/);
 });

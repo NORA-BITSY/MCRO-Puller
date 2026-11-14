@@ -1,5 +1,11 @@
 import { CONFIG } from './config.js';
 
+export function requireLiveMn() {
+  if (process.env.COURT_ALLOW_LIVE_MN !== 'true') {
+    throw Object.assign(new Error('Live Minnesota acquisition requires COURT_ALLOW_LIVE_MN=true'), { code: 'blocked' });
+  }
+}
+
 /**
  * Sleep for a random duration between requests. This is cooperative rate
  * limiting, not a guarantee that a request is permitted or will avoid blocks.
@@ -18,7 +24,7 @@ export async function sleepJitter(minMs = CONFIG.delays.minDelayMs, maxMs = CONF
 export async function ensureTermsAccepted(page) {
   try {
     const acceptBtn = page.locator('#tcModalAcceptBtn');
-    const isVisible = await acceptBtn.isVisible({ timeout: 2500 }).catch(() => false);
+    const isVisible = await acceptBtn.isVisible({ timeout: 2500 });
     if (isVisible) {
       console.log('  [WAF] Terms and Conditions modal detected; accepting...');
       await acceptBtn.click();
@@ -26,7 +32,7 @@ export async function ensureTermsAccepted(page) {
       return true;
     }
   } catch (err) {
-    // modal not present
+    throw new Error(`Unable to inspect or accept MCRO terms: ${err.message}`, { cause: err });
   }
   return false;
 }
@@ -38,7 +44,7 @@ export async function checkWafBlock(page) {
   try {
     const title = (await page.title()).toLowerCase();
     const url = page.url();
-    const content = await page.content().catch(() => '');
+    const content = await page.content();
 
     const blockIndicators = [
       'access denied',
@@ -48,6 +54,10 @@ export async function checkWafBlock(page) {
       'request blocked',
       'volt-adc',
       'the requested url was rejected',
+      'verify you are human',
+      'complete the captcha',
+      'too many requests',
+      'unusual traffic',
     ];
 
     for (const indicator of blockIndicators) {
@@ -61,6 +71,12 @@ export async function checkWafBlock(page) {
       }
     }
 
+    if (typeof page.locator === 'function') {
+      const challenge = page.locator('iframe[title*="challenge" i], iframe[title*="recaptcha" i], .g-recaptcha');
+      for (const item of await challenge.all()) {
+        if (await item.isVisible()) return { blocked: true, reason: 'Visible CAPTCHA challenge requires operator intervention' };
+      }
+    }
     return { blocked: false };
   } catch (err) {
     return {
@@ -93,12 +109,26 @@ export function normalizeCaseNumber(raw) {
 }
 
 export function caseNumbersEqual(left, right) {
-  const canonicalize = (value) => {
-    const parts = normalizeCaseNumber(value).split('-');
-    if (parts.length < 4) return normalizeCaseNumber(value);
-    parts[parts.length - 1] = String(Number.parseInt(parts.at(-1), 10));
-    parts[parts.length - 2] = String(Number.parseInt(parts.at(-2), 10));
-    return parts.join('-');
-  };
-  return canonicalize(left) === canonicalize(right);
+  const normalizedLeft = normalizeCaseNumber(left);
+  const normalizedRight = normalizeCaseNumber(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  const withoutLeadingZeros = (value) => value.replace(/^0+(?=\d)/, '');
+  const leftParts = normalizedLeft.split('-');
+  const rightParts = normalizedRight.split('-');
+  if (leftParts.length >= 4 && rightParts.length >= 4) {
+    for (const parts of [leftParts, rightParts]) {
+      parts[parts.length - 1] = withoutLeadingZeros(parts.at(-1));
+      parts[parts.length - 2] = withoutLeadingZeros(parts.at(-2));
+    }
+    return leftParts.join('-') === rightParts.join('-');
+  }
+  const parts = leftParts.length >= 4 ? leftParts : rightParts;
+  const compact = leftParts.length >= 4 ? normalizedRight : normalizedLeft;
+  if (parts.length < 4) return normalizedLeft === normalizedRight;
+  // Interpret a dashless request using the observed source's county/type/year,
+  // rather than guessing where an arbitrary digit string splits.
+  const prefix = parts.slice(0, -2).join('') + parts.at(-2);
+  if (!compact.startsWith(prefix)) return false;
+  const sequence = compact.slice(prefix.length);
+  return /^\d+$/.test(sequence) && withoutLeadingZeros(sequence) === withoutLeadingZeros(parts.at(-1));
 }

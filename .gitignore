@@ -4,3 +4,17 @@ downloads/
 .DS_Store
 *.tmp
 *.log
+.review/
+.runtime/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+omp-session-*.html
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log

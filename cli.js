@@ -3,19 +3,36 @@
 import { Command } from 'commander';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CONFIG } from './src/config.js';
 import { createBrowserClient } from './src/browser.js';
-import { searchCases, searchHearings } from './src/search.js';
+import { executeSearch, validateSearchOptions } from './src/search.js';
 import { crawlCase } from './src/crawler.js';
 import { loadState } from './src/state.js';
 import { verifyPdfBuffer } from './src/downloader.js';
-import { ProxyManager } from './src/proxy.js';
 import { WorkerQueue } from './src/queue.js';
 import { syncCase, syncAllActiveCases } from './src/sync.js';
-import { crawlStatewideActiveCases } from './src/statewide.js';
+import { crawlStatewideActiveCases, validateDiscoveryQuery } from './src/statewide.js';
 import { preprocessPdf } from './src/ocr.js';
 import { synthesizeCaseDossier } from './src/nlp.js';
 import { COUNTIES } from './src/counties.js';
+
+export function buildSearchQuery(options) {
+  const searchType = options.searchType || (options.judge || options.hearingFrom ? 'hearing' : options.case || options.citation ? 'case' : options.attorney || options.bar ? 'attorney' : options.business ? 'business' : 'party');
+  const fields = {
+    case: 'caseNumber', citation: 'citationNumber', name: 'lastName', first: 'firstName', middle: 'middleName',
+    business: 'businessName', attorney: 'attorneyLastName', attorneyFirst: 'attorneyFirstName', attorneyMiddle: 'attorneyMiddleName',
+    bar: 'barNumber', judge: 'judgeName', dobFrom: 'dobFrom', dobTo: 'dobTo', filedFrom: 'filedFrom', filedTo: 'filedTo',
+    hearingFrom: 'hearingFrom', hearingTo: 'hearingTo', docketedFrom: 'docketedFrom', docketedTo: 'docketedTo',
+    status: 'status', judgmentStatus: 'judgmentStatus',
+  };
+  const query = { searchType };
+  for (const [option, field] of Object.entries(fields)) if (options[option] !== undefined) query[field] = options[option];
+  if (options.soundex) query.soundex = true;
+  if (options.category !== undefined) query.categories = options.category.split(',').map((value) => value.trim().toUpperCase());
+  if (options.county !== undefined) query.counties = options.county.split(',').map((value) => value.trim());
+  return validateSearchOptions(query);
+}
 
 const program = new Command();
 
@@ -27,7 +44,8 @@ program
 // 1. SEARCH COMMAND (Covering all MCRO UI fields)
 program
   .command('search')
-  .description('Search MCRO cases using any or all search UI fields')
+  .description('Search MCRO using one validated case, name, attorney, document, hearing, or judgment mode')
+  .option('--search-type <type>', 'case, party, business, attorney, document, hearing, or judgment (inferred when omitted)')
   .option('-c, --case <caseNumber>', 'Search by Case Number (e.g., 67-CV-26-300)')
   .option('--citation <citationNumber>', 'Search by Citation Number')
   .option('-n, --name <lastName>', 'Party Last Name')
@@ -36,6 +54,8 @@ program
   .option('-b, --business <businessName>', 'Search as Business Name')
   .option('--soundex', 'Enable Sounds Like search', false)
   .option('-a, --attorney <lastName>', 'Attorney Last Name')
+  .option('--attorney-first <firstName>', 'Attorney First Name (required for attorney-name search)')
+  .option('--attorney-middle <middleName>', 'Attorney Middle Name')
   .option('--bar <barNumber>', 'Attorney MN Bar/License Number')
   .option('--judge <judgeName>', 'Judicial Officer Name (via Hearing Search)')
   .option('--hearing-from <date>', 'Hearing Date From (YYYY-MM-DD)')
@@ -44,55 +64,20 @@ program
   .option('--dob-to <date>', 'Date of Birth To (YYYY-MM-DD)')
   .option('--filed-from <date>', 'Date Filed From (YYYY-MM-DD)')
   .option('--filed-to <date>', 'Date Filed To (YYYY-MM-DD)')
+  .option('--docketed-from <date>', 'Judgment Docketed Date From (YYYY-MM-DD)')
+  .option('--docketed-to <date>', 'Judgment Docketed Date To (YYYY-MM-DD)')
+  .option('--judgment-status <status>', 'Exact Judgment Status label from the source')
   .option('--category <categories>', 'Case Categories (comma-separated: CV, CR, FAM, PR)')
-  .option('--status <status>', 'Case Status: Active, Inactive, All', 'All')
+  .option('--status <status>', 'Case Status: Active, Inactive, All')
   .option('--county <counties>', 'County name(s) (comma-separated, e.g. Hennepin,Ramsey)')
   .option('-m, --mode <mode>', 'Browser mode: "extension" or "standalone"', 'extension')
   .option('--headed', 'Run browser in headed mode', false)
-  .option('--proxy <proxy>', 'Proxy URL (http://user:pass@host:port)')
   .action(async (opts) => {
     let client;
     try {
-      const proxyObj = opts.proxy ? new ProxyManager().parseProxy(opts.proxy) : null;
-      client = await createBrowserClient({
-        mode: opts.mode,
-        headed: opts.headed,
-        proxy: proxyObj ? new ProxyManager().toPlaywrightProxy(proxyObj) : undefined,
-      });
-
-      const categories = opts.category ? opts.category.split(',').map((c) => c.trim().toUpperCase()) : [];
-      const counties = opts.county ? opts.county.split(',').map((c) => c.trim()) : [];
-
-      if (opts.judge) {
-        const result = await searchHearings(client.page, {
-          judgeName: opts.judge,
-          hearingDateFrom: opts.hearingFrom || '',
-          hearingDateTo: opts.hearingTo || '',
-          categories,
-          counties,
-        });
-        printSearchResults(result);
-      } else {
-        const result = await searchCases(client.page, {
-          caseNumber: opts.case || '',
-          citationNumber: opts.citation || '',
-          lastName: opts.name || '',
-          firstName: opts.first || '',
-          middleName: opts.middle || '',
-          businessName: opts.business || '',
-          soundex: opts.soundex,
-          attorneyLastName: opts.attorney || '',
-          barNumber: opts.bar || '',
-          dobFrom: opts.dobFrom || '',
-          dobTo: opts.dobTo || '',
-          filedDateFrom: opts.filedFrom || '',
-          filedDateTo: opts.filedTo || '',
-          categories,
-          caseStatus: opts.status,
-          counties,
-        });
-        printSearchResults(result);
-      }
+      const query = buildSearchQuery(opts);
+      client = await createBrowserClient({ mode: opts.mode, headed: opts.headed });
+      printSearchResults(await executeSearch(client.page, query));
     } catch (err) {
       console.error(`\n[Search Error] ${err.message}`);
       process.exitCode = 1;
@@ -110,16 +95,10 @@ program
   .option('--force', 'Re-download already existing files', false)
   .option('-m, --mode <mode>', 'Browser mode: "extension" or "standalone"', 'extension')
   .option('--headed', 'Run browser headed', false)
-  .option('--proxy <proxy>', 'Proxy URL (http://user:pass@host:port)')
   .action(async (caseNumber, opts) => {
     let client;
     try {
-      const proxyObj = opts.proxy ? new ProxyManager().parseProxy(opts.proxy) : null;
-      client = await createBrowserClient({
-        mode: opts.mode,
-        headed: opts.headed,
-        proxy: proxyObj ? new ProxyManager().toPlaywrightProxy(proxyObj) : undefined,
-      });
+      client = await createBrowserClient({ mode: opts.mode, headed: opts.headed });
 
       const res = await crawlCase(client, caseNumber, {
         outputDir: opts.out,
@@ -145,7 +124,6 @@ program
   .option('-f, --file <path>', 'Text file containing case numbers (one per line) or JSON array')
   .option('-c, --cases <list>', 'Comma-separated list of case numbers')
   .option('-w, --workers <count>', 'Number of concurrent workers (default: 1)', (v) => parseInt(v, 10), 1)
-  .option('-p, --proxies <path>', 'Path to proxies list file')
   .option('-o, --out <dir>', 'Output directory', CONFIG.outputDir)
   .option('--force', 'Force re-download existing files', false)
   .option('-m, --mode <mode>', 'Browser mode: "extension" or "standalone"')
@@ -187,15 +165,8 @@ program
 
     console.log(`[Bulk Download] Queuing ${uniqueCases.length} unique cases across ${opts.workers} worker(s)...`);
 
-    const proxyManager = opts.proxies ? new ProxyManager({ proxyFile: opts.proxies }) : null;
-    if (opts.proxies && proxyManager.proxies.length === 0) {
-      console.error(`No valid proxies were loaded from ${opts.proxies}`);
-      process.exitCode = 1;
-      return;
-    }
     const queue = new WorkerQueue({
       concurrency: opts.workers,
-      proxyManager,
       mode: opts.mode,
       headed: opts.headed,
       outputDir: opts.out,
@@ -235,7 +206,8 @@ program
 // 5. STATEWIDE COMMAND (County-partitioned discovery)
 program
   .command('statewide')
-  .description('Statewide active-case crawl with date bisection and explicit cap failures')
+  .description('County-partition one validated query with date bisection; not exhaustive statewide enumeration')
+  .option('--query <json>', 'Required canonical source query JSON, including a documented name/attorney/business criterion')
   .option('--county <counties>', 'Specific counties (comma-separated, default: all 87 counties)')
   .option('--category <categories>', 'Specific categories: CV,CR,FAM,PR (default: all)')
   .option('--days <number>', 'Only pull cases filed within past N days (default: 1)', (v) => parseInt(v, 10), 1)
@@ -245,7 +217,8 @@ program
   .action(async (opts) => {
     let client;
     try {
-      client = await createBrowserClient({ mode: opts.mode, headed: opts.headed });
+      if (!opts.query) throw Object.assign(new Error('Unrestricted statewide discovery is unsupported; supply --query with a validated source search'), { code: 'unsupported' });
+      const query = validateDiscoveryQuery(JSON.parse(opts.query));
       if (!Number.isInteger(opts.days) || opts.days < 1) {
         throw new Error('--days must be a positive integer');
       }
@@ -259,8 +232,10 @@ program
       const fromDate = new Date(now.getTime() - opts.days * 24 * 60 * 60 * 1000);
       const dateFrom = fromDate.toISOString().split('T')[0];
       const dateTo = now.toISOString().split('T')[0];
+      client = await createBrowserClient({ mode: opts.mode, headed: opts.headed });
 
       await crawlStatewideActiveCases(client, {
+        query,
         counties,
         categories,
         dateFrom,
@@ -333,47 +308,6 @@ program
     }
   });
 
-// 7. PROXY-TEST COMMAND
-program
-  .command('proxy-test')
-  .description('Test configured proxy connectivity and latency against the MCRO landing page')
-  .argument('<proxyFile>', 'Path to proxies list file')
-  .action(async (proxyFile) => {
-    console.log(`[Proxy Test] Testing proxies from ${proxyFile}...`);
-    const pm = new ProxyManager({ proxyFile });
-    const { chromium } = await import('playwright-extra');
-    const stealthPlugin = (await import('puppeteer-extra-plugin-stealth')).default;
-    chromium.use(stealthPlugin());
-
-    for (const p of pm.proxies) {
-      process.stdout.write(`Testing proxy ${p.server}... `);
-      const startTime = Date.now();
-      try {
-        const browser = await chromium.launch({
-          headless: true,
-          proxy: pm.toPlaywrightProxy(p),
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        });
-        const ctx = await browser.newContext();
-        const page = await ctx.newPage();
-        const resp = await page.goto(CONFIG.urls.base, { timeout: 15000 });
-        const latency = Date.now() - startTime;
-        const status = resp ? resp.status() : 0;
-        await browser.close();
-
-        if (status === 200) {
-          console.log(`✓ PASS (Status 200, ${latency}ms)`);
-          pm.reportSuccess(p);
-        } else {
-          console.log(`✗ FAIL (Status ${status}, ${latency}ms)`);
-          pm.reportFailure(p, `HTTP ${status}`);
-        }
-      } catch (err) {
-        console.log(`✗ ERROR: ${err.message.slice(0, 50)}`);
-        pm.reportFailure(p, err.message);
-      }
-    }
-  });
 
 // 8. VERIFY COMMAND
 program
@@ -554,6 +488,11 @@ program
   });
 
 function printSearchResults(result) {
+  if (result.documents) {
+    console.log(`\n${result.caseNumberRaw || 'No matching case'}: ${result.documents.length} document(s)`);
+    for (const document of result.documents) console.log(`  ${document.docTitle} (${document.pages || 'unknown'} pages)`);
+    return;
+  }
   console.log(`\nFound ${result.cases.length} result(s):`);
   console.log('--------------------------------------------------------------------------------');
   result.cases.forEach((c) => {
@@ -566,4 +505,4 @@ function printSearchResults(result) {
   });
 }
 
-await program.parseAsync();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await program.parseAsync();

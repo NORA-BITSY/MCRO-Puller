@@ -1,105 +1,81 @@
-import { searchByCaseNumber } from './search.js';
+import { executeSearch } from './search.js';
 import { navigateToCaseDetails } from './roa.js';
-import { downloadAllCaseDocuments } from './downloader.js';
-import { resolveCaseOutputDir } from './crawler.js';
-import { buildCaseStateRecord, loadState, updateState } from './state.js';
-import { caseNumbersEqual, sleepJitter, normalizeCaseNumber } from './waf.js';
+import { downloadAllCaseDocuments, safeCaseNumber } from './downloader.js';
+import { assertExactCase, resolveCaseOutputDir } from './crawler.js';
+import { buildCaseStateRecord, loadState, normalizeCaseStatus, updateState } from './state.js';
+import { caseNumbersEqual, sleepJitter } from './waf.js';
 
-/**
- * Check and incrementally update a single case.
- * Only downloads newly filed documents since the last sync.
- */
+/** Refresh every observed docket row, and acquire only missing or corrupt artifacts. */
 export async function syncCase(browserClient, caseNumber, options = {}) {
-  const normCase = normalizeCaseNumber(caseNumber);
-  console.log(`\n[Sync] Checking case for updates: ${normCase}...`);
-
-  const page = browserClient.page;
-  const searchResult = await searchByCaseNumber(page, normCase);
-  if (!searchResult.cases || searchResult.cases.length === 0) {
-    console.warn(`[Sync] Case ${normCase} not found in search results.`);
-    return { updated: false, reason: 'not_found' };
+  const normCase = safeCaseNumber(caseNumber);
+  const searchResult = await executeSearch(browserClient.page, { searchType: 'case', caseNumber: normCase });
+  if (!searchResult.cases?.length) {
+    await updateState((state) => {
+      state.pulledCases[normCase] = { ...state.pulledCases[normCase], status: 'not_found', lastRunAt: new Date().toISOString() };
+    }, options.stateFile);
+    return { success: false, updated: false, status: 'not_found', reason: 'not_found' };
   }
-
-  const caseItem = searchResult.cases.find((item) => caseNumbersEqual(item.caseNumber, normCase));
-  if (!caseItem) {
-    throw new Error(`Search returned results but no exact case-number match for ${normCase}`);
+  const candidate = searchResult.cases.find((item) => caseNumbersEqual(item.caseNumber, normCase));
+  if (!candidate) {
+    const error = new Error(`Search returned results but no exact case-number match for ${normCase}`);
+    error.code = 'parse_error';
+    throw error;
   }
-
-  const roaData = await navigateToCaseDetails(page, caseItem);
-  const canonicalCase = roaData.caseInfo.caseNumber || caseItem.caseNumber;
-  console.log(`[Sync] Verifying ${roaData.documentEventsCount} public document(s) for ${canonicalCase}.`);
-
-  const downloadSummary = await downloadAllCaseDocuments(page, roaData, {
-    ...options,
-    outputDir: resolveCaseOutputDir(canonicalCase, options),
-    force: false,
-  });
-
-  await updateState((state) => {
+  const roaData = await navigateToCaseDetails(browserClient.page, candidate);
+  const canonicalCase = assertExactCase(roaData, normCase);
+  const record = async (summary) => updateState((state) => {
     const previous = state.pulledCases[canonicalCase] || state.pulledCases[normCase] || {};
-    state.pulledCases[canonicalCase] = buildCaseStateRecord(roaData, downloadSummary, previous);
+    state.pulledCases[canonicalCase] = buildCaseStateRecord(roaData, summary, previous);
     if (canonicalCase !== normCase) delete state.pulledCases[normCase];
   }, options.stateFile);
-
-  return {
-    updated: downloadSummary.downloaded.length > 0,
-    newDocs: downloadSummary.downloaded.length,
-    verifiedDocs: downloadSummary.documents.length,
-    summary: downloadSummary,
-  };
+  let summary;
+  try {
+    summary = await downloadAllCaseDocuments(browserClient.page, roaData, { ...options, outputDir: resolveCaseOutputDir(canonicalCase, options), force: false });
+  } catch (error) {
+    if (error.summary) await record(error.summary);
+    throw error;
+  }
+  await record(summary);
+  return { success: summary.status === 'complete', status: summary.status, updated: summary.downloaded.length > 0,
+    newDocs: summary.downloaded.length, verifiedDocs: summary.documents.length, summary };
 }
 
-/**
- * Sync all known active cases in state.json.
- */
+/** Unknown legacy statuses may refresh; Inactive/Closed never match Active by substring. */
 export async function syncAllActiveCases(browserClient, options = {}) {
   const state = loadState(options.stateFile);
-  const entries = Object.entries(state.pulledCases || {});
-  const activeEntries = entries.filter(([, record]) => {
-    if (!record.caseStatus) return true;
-    return /active|open/i.test(record.caseStatus);
-  });
-  const caseNumbers = activeEntries.map(([caseNumber]) => caseNumber);
-
-  console.log(`\n======================================================`);
-  console.log(`[Sync Manager] Starting sync of ${caseNumbers.length} active or legacy-unclassified case(s)...`);
-  console.log(`======================================================`);
-
-  let updatedCount = 0;
-  let upToDateCount = 0;
-  let failedCount = 0;
-
-  for (let i = 0; i < caseNumbers.length; i++) {
-    const caseNo = caseNumbers[i];
-    console.log(`\n--- Syncing [${i + 1}/${caseNumbers.length}]: ${caseNo} ---`);
-
+  const cases = Object.entries(state.pulledCases || {}).filter(([, record]) => ['active', 'unknown'].includes(normalizeCaseStatus(record.caseStatus))).map(([caseNumber]) => caseNumber);
+  const summary = { total: cases.length, updatedCount: 0, upToDateCount: 0, failedCount: 0, status: 'complete', pending: [], results: [] };
+  const synchronize = options.syncCase || syncCase;
+  for (let index = 0; index < cases.length; index++) {
+    const caseNumber = cases[index];
     try {
-      const result = await syncCase(browserClient, caseNo, options);
-      if (result.updated) {
-        updatedCount++;
-        console.log(`  ✓ Case ${caseNo} updated with ${result.newDocs} new or repaired document(s).`);
-      } else {
-        upToDateCount++;
-      }
+      const result = await synchronize(browserClient, caseNumber, options);
+      summary.results.push({ caseNumber, ...result });
+      const complete = result.status === 'complete' || (!result.status && !result.reason && result.success !== false);
+      if (!complete) {
+        summary.failedCount++;
+        if (result.status === 'blocked') {
+          summary.status = 'blocked';
+          summary.pending = cases.slice(index);
+          break;
+        }
+      } else if (result.updated) summary.updatedCount++;
+      else summary.upToDateCount++;
     } catch (error) {
-      failedCount++;
-      console.error(`  ✗ Error syncing ${caseNo}: ${error.message}`);
-      if (error.message.includes('[WAF BLOCKED]')) throw error;
+      summary.failedCount++;
+      summary.results.push({ caseNumber, status: error.code === 'blocked' ? 'blocked' : 'error', error: error.message });
+      if (error.code === 'blocked') {
+        summary.status = 'blocked';
+        summary.pending = cases.slice(index);
+        break;
+      }
     }
-
-    if (i < caseNumbers.length - 1) {
-      const jitter = await sleepJitter();
-      console.log(`[Rate Limit] Pausing ${Math.round(jitter / 1000)}s before next case...`);
-    }
+    if (index < cases.length - 1) await sleepJitter();
   }
-
-  const summary = { total: caseNumbers.length, updatedCount, upToDateCount, failedCount };
-  console.log(`\n======================================================`);
-  console.log(`[Sync Manager] Sync finished: ${updatedCount} updated, ${upToDateCount} unchanged, ${failedCount} errors.`);
-  console.log(`======================================================`);
-
-  if (failedCount > 0) {
-    const error = new Error(`${failedCount} case sync(s) failed; the run is incomplete`);
+  if (summary.failedCount) {
+    if (summary.status !== 'blocked') summary.status = 'partial';
+    const error = new Error(`${summary.failedCount} case sync(s) failed; the run is ${summary.status}`);
+    error.code = summary.status;
     error.summary = summary;
     throw error;
   }

@@ -1,0 +1,72 @@
+name: court-platform
+
+x-app: &app
+  image: court-platform:local
+  build: .
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,size=1g,uid=1000,gid=1000
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  environment: &environment
+    COURT_DATABASE_URL: postgresql://court:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD (URL-safe)}@postgres:5432/court
+    COURT_STORAGE_DIR: /var/lib/court
+    COURT_ALLOW_LIVE_MN: "false"
+    API_TOKEN_READ: ${API_TOKEN_READ:?Set API_TOKEN_READ}
+    API_TOKEN_WRITE: ${API_TOKEN_WRITE:?Set API_TOKEN_WRITE}
+    API_TOKEN_ADMIN: ${API_TOKEN_ADMIN:?Set API_TOKEN_ADMIN}
+    PORT: "3000"
+  volumes:
+    - artifacts:/var/lib/court
+  mem_limit: 2g
+  cpus: 2.0
+  pids_limit: 256
+
+services:
+  postgres:
+    image: postgres:17-bookworm@sha256:40865bc877a289da75963d97d72b59633f639fc5af7a4e856bfa3714cae5b536
+    environment:
+      POSTGRES_DB: court
+      POSTGRES_USER: court
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD (URL-safe)}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U court -d court"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+  migrate:
+    <<: *app
+    command: [node, dist/src/platform/courtctl.js, db, migrate]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    <<: *app
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  worker:
+    <<: *app
+    command: [node, dist/src/platform/worker.js]
+    shm_size: 1g
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres:
+  artifacts:

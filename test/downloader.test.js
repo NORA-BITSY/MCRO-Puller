@@ -12,6 +12,27 @@ function tempDirectory(t) {
   return directory;
 }
 
+function validPdf() {
+  const stream = `BT /F1 12 Tf 72 720 Td (Valid fixture) Tj ET\n%${' '.repeat(1100)}\n`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}endstream`,
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 6\n0000000000 65535 f \n${offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}`;
+  pdf += `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf);
+}
+
 function documentEvent(index, description = 'Order') {
   return {
     index,
@@ -47,23 +68,15 @@ function fakePage(pdfBuffer) {
   let requests = 0;
   return {
     get requestCount() { return requests; },
-    evaluate: async (_callback, input) => ({
-      action: 'https://publicaccess.courts.state.mn.us/CaseSearch/DownloadDocument',
-      fields: [['DocumentDownloadToken', input.downloadToken], ['__RequestVerificationToken', 'csrf']],
-    }),
-    request: {
-      post: async (_url, options) => {
-        requests++;
-        assert.match(options.data, /DocumentDownloadToken=token-1/);
-        return {
-          ok: () => true,
-          status: () => 200,
-          statusText: () => 'OK',
-          headers: () => ({ 'content-disposition': 'attachment; filename="Order.pdf"' }),
-          body: async () => pdfBuffer,
-          dispose: async () => {},
-        };
-      },
+    evaluate: async (_callback, input) => {
+      requests++;
+      assert.equal(input.downloadToken, 'token-1');
+      return {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'content-disposition': 'attachment; filename="Order.pdf"' },
+        base64: pdfBuffer.toString('base64'),
+      };
     },
   };
 }
@@ -86,7 +99,7 @@ test('case output directories isolate each case', () => {
 
 test('download manifest verifies and skips an unchanged document on the next run', async (t) => {
   const directory = tempDirectory(t);
-  const pdf = Buffer.from(`%PDF-1.4\n${'x'.repeat(1200)}\n%%EOF\n`);
+  const pdf = validPdf();
   const page = fakePage(pdf);
   const event = documentEvent(1);
 

@@ -1,504 +1,284 @@
 import { CONFIG } from './config.js';
-import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual } from './waf.js';
-import { lookupCounty } from './counties.js';
+import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual, requireLiveMn } from './waf.js';
+import { COUNTIES } from './counties.js';
+
+function resolveCounty(value) {
+  const normalized = value.trim().toLowerCase();
+  return COUNTIES.find((county) => [county.name, county.code, county.id].some((candidate) => String(candidate).toLowerCase() === normalized));
+}
+
+// Labels and requirements: Minnesota SCAO search quick-reference guides, 2022-08-05.
+// These are documented UI contracts, not a claim of live DOM verification.
+const common = ['soundex', 'county', 'counties'];
+const names = ['lastName', 'firstName', 'middleName'];
+const attorneys = ['attorneyLastName', 'attorneyFirstName', 'attorneyMiddleName', 'barNumber'];
+const caseFilters = ['filedFrom', 'filedTo', 'status', 'categories', ...common];
+export const SEARCH_MODES = {
+  case: { required: ['caseNumber OR citationNumber'], optional: ['caseNumber', 'citationNumber'] },
+  party: { required: ['lastName', 'firstName'], optional: [...names, 'dobFrom', 'dobTo', ...caseFilters] },
+  business: { required: ['businessName'], optional: ['businessName', ...caseFilters] },
+  attorney: { required: ['barNumber OR (attorneyLastName AND attorneyFirstName)'], optional: [...attorneys, ...caseFilters] },
+  document: { required: ['caseNumber'], optional: ['caseNumber'] },
+  hearing: { required: ['hearingFrom', 'caseNumber OR judgeName OR businessName OR (lastName AND firstName) OR attorney'], optional: ['caseNumber', 'judgeName', 'businessName', ...names, ...attorneys, 'hearingFrom', 'hearingTo', 'categories', ...common] },
+  judgment: { required: ['businessName OR (lastName AND firstName)'], optional: ['businessName', ...names, 'docketedFrom', 'docketedTo', 'judgmentStatus', ...common] },
+};
+
+export function validateSearchOptions(input = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Search must be an object');
+  const query = { ...input, searchType: input.searchType || 'case' };
+  const mode = SEARCH_MODES[query.searchType];
+  if (!mode) throw new Error(`Unsupported searchType: ${query.searchType}`);
+  const allowed = new Set(['searchType', 'sourceId', 'acquireResults', ...mode.optional]);
+  for (const [key, value] of Object.entries(query)) {
+    if (!allowed.has(key)) throw new Error(`Field ${key} is not supported for ${query.searchType} search`);
+    if (value === undefined) { delete query[key]; continue; }
+    if (['soundex', 'acquireResults'].includes(key)) {
+      if (typeof value !== 'boolean') throw new Error(`${key} must be boolean`);
+    } else if (['counties', 'categories'].includes(key)) {
+      if (!Array.isArray(value) || !value.length || value.some((item) => typeof item !== 'string' || !item.trim())) throw new Error(`${key} must be a nonempty string array`);
+    } else if (typeof value !== 'string' || !value.trim()) throw new Error(`${key} must be a nonempty string`);
+  }
+  if (query.county && query.counties) throw new Error('Use county or counties, not both');
+  if (query.sourceId !== 'independent-fixture') {
+    for (const county of query.counties || (query.county ? [query.county] : [])) if (!resolveCounty(county)) throw new Error(`Unknown county: ${county}`);
+  }
+  if (query.categories?.some((value) => !['CV', 'CR', 'FAM', 'PR'].includes(value))) throw new Error('Unknown case category');
+  if (query.status && !['all', 'active', 'inactive', '0', '1', '2'].includes(query.status.toLowerCase())) throw new Error('Unknown case status');
+  for (const prefix of ['filed', 'dob', 'hearing', 'docketed']) {
+    const from = query[`${prefix}From`]; const to = query[`${prefix}To`];
+    for (const date of [from, to].filter(Boolean)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date) throw new Error(`${prefix} date must be a valid YYYY-MM-DD date`);
+    }
+    if (to && !from) throw new Error(`${prefix}From is required with ${prefix}To`);
+    if (from && to && from > to) throw new Error(`${prefix} date range is reversed`);
+  }
+  const hasPerson = !!(query.lastName || query.firstName || query.middleName);
+  const hasAttorneyName = !!(query.attorneyLastName || query.attorneyFirstName || query.attorneyMiddleName);
+  if (hasPerson && !(query.lastName && query.firstName)) throw new Error('Person search requires lastName and firstName');
+  if (hasAttorneyName && !(query.attorneyLastName && query.attorneyFirstName)) throw new Error('Attorney name search requires attorneyLastName and attorneyFirstName');
+  if (query.barNumber && hasAttorneyName) throw new Error('Use attorney name or barNumber, not both');
+  if (query.barNumber && !/^[\d-]+$/.test(query.barNumber)) throw new Error('Invalid barNumber');
+  if (query.soundex !== undefined && (query.barNumber || query.judgeName)) throw new Error('Sounds Like applies only to person, business, or attorney names');
+  const selectors = [query.caseNumber, query.citationNumber, query.businessName, hasPerson, query.barNumber || hasAttorneyName, query.judgeName].filter(Boolean);
+  if (selectors.length !== 1) throw new Error('Select exactly one case, citation, person, business, attorney, or judicial officer criterion');
+  if (query.searchType === 'party' && !hasPerson) throw new Error('Person search requires firstName and lastName');
+  if (query.searchType === 'business' && !query.businessName) throw new Error('Business search requires businessName');
+  if (query.searchType === 'attorney' && !(query.barNumber || hasAttorneyName)) throw new Error('Attorney search requires a name or barNumber');
+  if (query.searchType === 'document' && !query.caseNumber) throw new Error('Document search requires caseNumber');
+  if (query.searchType === 'hearing' && !query.hearingFrom) throw new Error('Hearing search requires hearingFrom');
+  if (query.searchType === 'hearing' && query.caseNumber && ['categories', 'county', 'counties', 'soundex'].some((key) => query[key] !== undefined)) throw new Error('Hearing case-number search does not support name/location/category options');
+  for (const key of [...names, ...attorneys.filter((key) => key !== 'barNumber'), 'businessName']) {
+    const value = query[key];
+    if (!value) continue;
+    if (value.includes('*') && (!/^[^*]{2,}\*$/.test(value) || query.soundex)) throw new Error('Wildcard requires at least two leading characters and cannot be combined with Sounds Like');
+  }
+  if ((query.caseNumber || query.citationNumber) && !/^[a-zA-Z0-9-]+$/.test(query.caseNumber || query.citationNumber)) throw new Error('Case/citation numbers must contain only letters, numbers, and hyphens');
+  if (query.caseNumber && query.sourceId !== 'independent-fixture' &&
+      !/^(?:\d{1,2}[A-Z]{0,2}-[A-Z]{2,4}(?:-[A-Z]{2,4})?-\d{2,4}-\d+|\d{1,2}[A-Z]{2,8}\d{3,})$/i.test(query.caseNumber)) {
+    throw new Error('A complete Minnesota case number is required (county, case type, year, and sequence)');
+  }
+  return query;
+}
+
+export function sanitizeSourceData(value) {
+  if (Array.isArray(value)) return value.map(sanitizeSourceData);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !/token|cookie|authorization|password|secret|session|formSelector|btnSelector/i.test(key))
+    .map(([key, item]) => [key, sanitizeSourceData(item)]));
+  if (typeof value === 'string' && /^https?:\/\//i.test(value)) {
+    try { const url = new URL(value); url.username = ''; url.password = ''; url.hash = ''; for (const key of [...url.searchParams.keys()]) if (/token|auth|session|signature|key|credential/i.test(key)) url.searchParams.delete(key); return url.toString(); } catch { return ''; }
+  }
+  return value;
+}
 
 async function assertSearchPageHealthy(page, context) {
-  const wafCheck = await checkWafBlock(page);
-  if (wafCheck.blocked) throw new Error(`[WAF BLOCKED] ${wafCheck.reason}`);
-
-  const title = await page.title().catch(() => '');
-  if (/error|service unavailable/i.test(title)) {
-    throw new Error(`${context} returned an unexpected page titled \"${title}\" at ${page.url()}`);
-  }
+  const result = await checkWafBlock(page);
+  if (result.blocked) throw Object.assign(new Error(result.reason), { code: 'blocked' });
+  if (/error|service unavailable/i.test(await page.title())) throw Object.assign(new Error(`${context} returned an error page`), { code: 'retryable' });
 }
 
-/**
- * Universal Case Search covering ALL MCRO fields.
- */
-export async function searchCases(page, options = {}) {
-  const {
-    caseNumber = '',
-    citationNumber = '',
-    lastName = '',
-    firstName = '',
-    middleName = '',
-    businessName = '',
-    soundex = false,
-    barNumber = '',
-    attorneyLastName = '',
-    attorneyFirstName = '',
-    dobFrom = '',
-    dobTo = '',
-    dobExact = true,
-    filedDateFrom = '',
-    filedDateTo = '',
-    filedDateExact = true,
-    categories = [], // ['CV', 'CR', 'FAM', 'PR']
-    caseStatus = '0', // '0'|'All', '1'|'Active', '2'|'Inactive'
-    counties = [], // ['Hennepin', 'Ramsey'] or ['cty-116'] or 'all'
-  } = options;
-
-  console.log('[Search] Opening MCRO Case Search...');
-  await page.goto(CONFIG.urls.caseSearch, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
-  await ensureTermsAccepted(page);
-  await assertSearchPageHealthy(page, 'Case search');
-
-  // 1. CASE NUMBER SEARCH
-  if (caseNumber) {
-    console.log(`[Search] Performing Case Number search for: "${caseNumber}"`);
-    const tab = page.locator('#MpaCaseSearchCaseNumberTypeTab');
-    await tab.click();
-    await page.waitForTimeout(500);
-    await page.locator('#CaseSearchNumber').fill(caseNumber);
-    const result = await submitSearchAndParse(page);
-    const exactCases = result.cases.filter((item) => caseNumbersEqual(item.caseNumber, caseNumber));
-    if (result.cases.length > 0 && exactCases.length === 0) {
-      throw new Error(
-        `MCRO returned non-matching case number(s) for ${normalizeCaseNumber(caseNumber)}: ` +
-        result.cases.map((item) => item.caseNumber).join(', ')
-      );
-    }
-    return { ...result, totalFound: exactCases.length, noResults: exactCases.length === 0, cases: exactCases };
-  }
-
-  // 2. CITATION NUMBER SEARCH
-  if (citationNumber) {
-    console.log(`[Search] Performing Citation Number search for: "${citationNumber}"`);
-    const tab = page.locator('#MpaCaseSearchCitationNumberTypeTab');
-    await tab.click();
-    await page.waitForTimeout(500);
-    await page.locator('#CaseSearchNumber').fill(citationNumber);
-    return await submitSearchAndParse(page);
-  }
-
-  // 3. ATTORNEY SEARCH
-  if (barNumber || attorneyLastName) {
-    console.log(`[Search] Performing Attorney search: Bar="${barNumber}", Name="${attorneyLastName}, ${attorneyFirstName}"`);
-    const tab = page.locator('#MpaCaseSearchAttorneyTypeTab');
-    await tab.click();
-    await page.waitForTimeout(500);
-
-    if (barNumber) {
-      const licTab = page.locator('#MpaCaseSearchAttyTypeNameTab').nth(1);
-      await licTab.click();
-      await page.waitForTimeout(500);
-      await page.locator('#CaseSearchNumber').fill(barNumber);
-    } else {
-      const nameTab = page.locator('#MpaCaseSearchAttyTypeNameTab').nth(0);
-      await nameTab.click();
-      await page.waitForTimeout(500);
-      if (attorneyLastName) await page.locator('#LastName').fill(attorneyLastName);
-      if (attorneyFirstName) await page.locator('#FirstName').fill(attorneyFirstName);
-      if (soundex) {
-        const sCb = page.locator('#Soundex');
-        if (await sCb.isVisible()) await sCb.check();
+function labelPattern(label) {
+  return new RegExp(`^\\s*${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[:*]?\\s*$`, 'i');
+}
+async function visible(locator, label) {
+  const matches = [];
+  for (const candidate of await locator.all()) if (await candidate.isVisible()) matches.push(candidate);
+  if (matches.length !== 1) throw Object.assign(new Error(`Documented MCRO control "${label}" resolved to ${matches.length} visible elements; source UI needs review`), { code: 'parse_error' });
+  return matches[0];
+}
+async function choose(page, label) {
+  // These IDs were observed in the preserved MCRO session, not inferred.
+  const observed = { Name: '#MpaCaseSearchNameTypeTab', Person: '#MpaCaseSearchNameTypePersonTab', Business: '#MpaCaseSearchNameTypeBusinessTab', 'Case Number': '#MpaCaseSearchCaseNumberTypeTab', 'Citation Number': '#MpaCaseSearchCitationNumberTypeTab', Attorney: '#MpaCaseSearchAttorneyTypeTab', County: '#mpaLocOptionToggleCounty' };
+  if (observed[label] && await page.locator(observed[label]).isVisible()) return page.locator(observed[label]).click();
+  await (await visible(page.getByText(label, { exact: true }), label)).click();
+}
+async function field(page, label) {
+  const observed = { 'Last Name': '#LastName', 'First Name': '#FirstName', 'Middle Name': '#MiddleName', 'Sounds Like': '#Soundex', 'Enter Case Number': '#CaseSearchNumber', 'Enter Citation Number': '#CaseSearchNumber', 'Enter Attorney Bar Number': '#CaseSearchNumber', 'Judicial Officer Name': '#JudicialOfficerName', 'Case Status': '#CaseStatus', 'Judgment Status': '#JudgmentStatus' };
+  if (observed[label] && await page.locator(observed[label]).isVisible()) return page.locator(observed[label]);
+  return visible(page.getByLabel(labelPattern(label)), label);
+}
+async function fill(page, label, value) { if (value !== undefined) await (await field(page, label)).fill(value); }
+async function dateRange(page, label, from, to) {
+  if (!from) return;
+  const ids = { 'Date of Birth': ['DobFrom', 'DobTo'], 'Date Filed': ['FiledDateFrom', 'FiledDateTo'], 'Hearing Date': ['HearingDateFrom', 'HearingDateTo'], 'Docketed Date': ['DocketedDateFrom', 'DocketedDateTo'] }[label];
+  const choice = to && to !== from ? 'Range' : 'On';
+  const observedToggle = { 'Date of Birth': `#mpaCaseSearchDobToggle${choice}`, 'Date Filed': `#mpaCaseSearchDateFiledToggle${choice}` }[label];
+  if (observedToggle && await page.locator(observedToggle).count()) await page.locator(observedToggle).click();
+  else {
+    // Hearing/judgment toggle IDs are not assumed: discover the actual enclosing
+    // group and click its documented On/Range control.
+    await page.evaluate(({ fromId, choice }) => {
+      const input = document.getElementById(fromId);
+      let root = input?.parentElement;
+      while (root && root !== document.body) {
+        const controls = [...root.querySelectorAll('button, label, a')].filter((node) => node.textContent.trim() === choice);
+        if (controls.length === 1) { controls[0].click(); return; }
+        root = root.parentElement;
       }
+      throw new Error(`Date toggle ${choice} not found for ${fromId}`);
+    }, { fromId: ids[0], choice });
+  }
+  const input = page.locator(`#${ids[0]}`);
+  const format = (date) => `${date.slice(5, 7)}/${date.slice(8, 10)}/${date.slice(0, 4)}`;
+  await input.fill((await input.getAttribute('type')) === 'date' ? from : format(from));
+  if (to && to !== from) {
+    const upper = page.locator(`#${ids[1]}`);
+    await upper.fill((await upper.getAttribute('type')) === 'date' ? to : format(to));
+  }
+}
+
+async function applyQuery(page, query) {
+  const mode = query.searchType;
+  if (mode === 'document') { await page.locator('#CaseNumber').fill(query.caseNumber); return; }
+  if (query.caseNumber || query.citationNumber) {
+    const label = query.caseNumber ? 'Case Number' : 'Citation Number';
+    await choose(page, label); await fill(page, `Enter ${label}`, query.caseNumber || query.citationNumber);
+  } else if (query.judgeName) {
+    await choose(page, 'Judicial Officer');
+    const control = await field(page, 'Judicial Officer Name');
+    if (await control.evaluate((node) => node.tagName === 'SELECT')) await control.selectOption({ label: query.judgeName });
+    else {
+      await control.fill(query.judgeName);
+      const option = page.getByRole('option', { name: query.judgeName, exact: true });
+      await (await visible(option, query.judgeName)).click();
     }
-
-    await applyAdditionalSearchOptions(page, {
-      filedDateFrom,
-      filedDateTo,
-      filedDateExact,
-      categories,
-      caseStatus,
-      counties,
-    });
-
-    return await submitSearchAndParse(page);
+  } else if (query.barNumber || query.attorneyLastName) {
+    await choose(page, 'Attorney'); await choose(page, query.barNumber ? 'Attorney Bar Number' : 'Attorney Name');
+    if (query.barNumber) await fill(page, 'Enter Attorney Bar Number', query.barNumber);
+    else { await fill(page, 'Last Name', query.attorneyLastName); await fill(page, 'First Name', query.attorneyFirstName); await fill(page, 'Middle Name', query.attorneyMiddleName); }
+  } else {
+    if (mode !== 'judgment') await choose(page, 'Name');
+    await choose(page, query.businessName ? 'Business' : 'Person');
+    if (query.businessName) {
+      const control = await visible(page.getByLabel(/^(?:Enter )?Business Name\s*[:*]?\s*$/i), 'Business Name'); await control.fill(query.businessName);
+    } else { await fill(page, 'Last Name', query.lastName); await fill(page, 'First Name', query.firstName); await fill(page, 'Middle Name', query.middleName); }
   }
-
-  // 4. BUSINESS NAME SEARCH
-  if (businessName) {
-    console.log(`[Search] Performing Business Name search for: "${businessName}"`);
-    const nameTab = page.locator('#MpaCaseSearchNameTypeTab');
-    await nameTab.click();
-    await page.waitForTimeout(500);
-    const bizTab = page.locator('#MpaCaseSearchNameTypeBusinessTab');
-    await bizTab.click();
-    await page.waitForTimeout(500);
-    await page.locator('#BusinessName').fill(businessName);
-
-    await applyAdditionalSearchOptions(page, {
-      filedDateFrom,
-      filedDateTo,
-      filedDateExact,
-      categories,
-      caseStatus,
-      counties,
-    });
-
-    return await submitSearchAndParse(page);
+  if (query.soundex !== undefined) await (await field(page, 'Sounds Like')).setChecked(query.soundex);
+  if (mode === 'hearing') await dateRange(page, 'Hearing Date', query.hearingFrom, query.hearingTo);
+  const hasAdditional = ['dobFrom', 'filedFrom', 'docketedFrom', 'status', 'judgmentStatus', 'categories', 'county', 'counties'].some((key) => query[key] !== undefined);
+  if (hasAdditional) {
+    const observed = page.locator('#MpaAdditionalCriteriaHeader');
+    const toggle = await observed.count() ? observed : await visible(page.getByText('Additional Search Options', { exact: true }), 'Additional Search Options');
+    if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click();
   }
-
-  // 5. PERSON NAME SEARCH (or general filter search if name is empty)
-  console.log(`[Search] Performing Person Name search: "${lastName}, ${firstName}"`);
-  const nameTab = page.locator('#MpaCaseSearchNameTypeTab');
-  await nameTab.click();
-  await page.waitForTimeout(500);
-  const personTab = page.locator('#MpaCaseSearchNameTypePersonTab');
-  await personTab.click();
-  await page.waitForTimeout(500);
-
-  if (lastName) await page.locator('#LastName').fill(lastName);
-  if (firstName) await page.locator('#FirstName').fill(firstName);
-  if (middleName) await page.locator('#MiddleName').fill(middleName);
-  if (soundex) {
-    const sCb = page.locator('#Soundex');
-    if (await sCb.isVisible()) await sCb.check();
+  await dateRange(page, 'Date of Birth', query.dobFrom, query.dobTo);
+  await dateRange(page, 'Date Filed', query.filedFrom, query.filedTo);
+  await dateRange(page, 'Docketed Date', query.docketedFrom, query.docketedTo);
+  if (query.status) {
+    const statuses = { '0': 'All', '1': 'Active', '2': 'Inactive', all: 'All', active: 'Active', inactive: 'Inactive' };
+    await (await field(page, 'Case Status')).selectOption({ label: statuses[query.status.toLowerCase()] });
   }
-
-  // Apply DOB if given
-  if (dobFrom || dobTo) {
-    await openAdditionalSearchOptions(page);
-    if (!dobExact || (dobFrom && dobTo && dobFrom !== dobTo)) {
-      await page.locator('#mpaCaseSearchDobToggleRange').click().catch(() => {});
-      if (dobFrom) await page.locator('#DobFrom').fill(dobFrom);
-      if (dobTo) await page.locator('#DobTo').fill(dobTo);
-    } else {
-      await page.locator('#mpaCaseSearchDobToggleOn').click().catch(() => {});
-      if (dobFrom) await page.locator('#DobFrom').fill(dobFrom);
-    }
+  if (query.judgmentStatus) await (await field(page, 'Judgment Status')).selectOption({ label: query.judgmentStatus });
+  if (query.categories) {
+    const controls = page.locator('input[name="CaseCategoryKeys"]'); // Existing source-observed group name.
+    if (!(await controls.count())) throw new Error('Case category controls are absent');
+    for (const control of await controls.all()) await control.setChecked(query.categories.includes(await control.getAttribute('value')));
   }
-
-  await applyAdditionalSearchOptions(page, {
-    filedDateFrom,
-    filedDateTo,
-    filedDateExact,
-    categories,
-    caseStatus,
-    counties,
-  });
-
-  return await submitSearchAndParse(page);
-}
-
-/**
- * Apply common Additional Search Options (Date Filed, Categories, Status, Locations).
- */
-async function applyAdditionalSearchOptions(page, options = {}) {
-  const { filedDateFrom, filedDateTo, filedDateExact, categories = [], caseStatus, counties = [] } = options;
-
-  const hasOptions =
-    filedDateFrom ||
-    filedDateTo ||
-    categories.length > 0 ||
-    (caseStatus && caseStatus !== '0' && caseStatus !== 'All') ||
-    (counties && counties.length > 0);
-
-  if (!hasOptions) return;
-
-  await openAdditionalSearchOptions(page);
-
-  // 1. Date Filed
-  if (filedDateFrom || filedDateTo) {
-    if (!filedDateExact || (filedDateFrom && filedDateTo && filedDateFrom !== filedDateTo)) {
-      await page.locator('#mpaCaseSearchDateFiledToggleRange').click().catch(() => {});
-      if (filedDateFrom) await page.locator('#FiledDateFrom').fill(filedDateFrom);
-      if (filedDateTo) await page.locator('#FiledDateTo').fill(filedDateTo);
-    } else {
-      await page.locator('#mpaCaseSearchDateFiledToggleOn').click().catch(() => {});
-      if (filedDateFrom) await page.locator('#FiledDateFrom').fill(filedDateFrom);
-    }
-  }
-
-  // 2. Categories
-  if (categories && categories.length > 0) {
-    const allowed = new Set(['CV', 'CR', 'FAM', 'PR']);
-    const codes = categories.map((category) => String(category).toUpperCase());
-    const invalid = codes.filter((code) => !allowed.has(code));
-    if (invalid.length > 0) throw new Error(`Unknown case categories: ${invalid.join(', ')}`);
-
-    await page.evaluate((catCodes) => {
-      for (const code of catCodes) {
-        const input = document.querySelector(`input[name="CaseCategoryKeys"][value="${code}"]`);
-        if (!input) throw new Error(`Case category control not found: ${code}`);
-        input.checked = true;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    }, codes);
-  }
-
-  // 3. Case Status (0: All, 1: Active, 2: Inactive)
-  if (caseStatus !== undefined && caseStatus !== null) {
-    const status = String(caseStatus).toLowerCase();
-    let value = '0';
-    if (status === '1' || status === 'active') value = '1';
-    else if (status === '2' || status === 'inactive') value = '2';
-    else if (status !== '0' && status !== 'all') throw new Error(`Unknown case status: ${caseStatus}`);
-    await page.locator('#CaseStatus').selectOption(value);
-  }
-
-  // 4. Counties / Court Locations
-  if (counties && counties.length > 0 && counties !== 'all') {
-    await page.locator('#mpaLocOptionToggleCounty').click();
-    const countyList = Array.isArray(counties) ? counties : [counties];
-    const resolved = countyList.map((county) => ({ county, match: lookupCounty(county) }));
-    const invalid = resolved.filter(({ match }) => !match).map(({ county }) => county);
-    if (invalid.length > 0) throw new Error(`Unknown counties: ${invalid.join(', ')}`);
-    const codes = resolved.map(({ match }) => match.code);
-
-    await page.evaluate((countyCodes) => {
-      for (const code of countyCodes) {
-        const input = document.querySelector(`input[name="Locations"][value="${code}"]`);
-        if (!input) throw new Error(`County control not found: ${code}`);
-        input.checked = true;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    }, codes);
+  const counties = query.counties || (query.county ? [query.county] : []);
+  if (counties.length) {
+    await choose(page, 'County');
+    const codes = counties.map((county) => resolveCounty(county).code);
+    const controls = page.locator('input[name="Locations"]');
+    for (const code of codes) if (await controls.filter({ visible: true }).count() === 0 || await page.locator(`input[name="Locations"][value=${JSON.stringify(code)}]`).count() !== 1) throw new Error(`County control missing: ${code}`);
+    for (const control of await controls.all()) if (await control.isVisible()) await control.setChecked(codes.includes(await control.getAttribute('value')));
   }
 }
 
-async function openAdditionalSearchOptions(page) {
-  const advBtn = page.locator('#MpaAdditionalCriteriaHeader');
-  const isExpanded = (await advBtn.getAttribute('aria-expanded')) === 'true';
-  if (!isExpanded && (await advBtn.isVisible())) {
-    await advBtn.click();
-    await page.waitForTimeout(600);
+export async function waitForSearchResults(page, timeoutMs = CONFIG.delays.searchTimeoutMs) {
+  try {
+    await page.waitForFunction(() => {
+      const text = document.body.innerText;
+      return document.querySelector('#mpaCardsWrapper, form[action*="DownloadDocument"]') ||
+        /Your search returned no results|No (?:cases|hearings|judgments) were found|Documents Available Online|The value .*not valid|field is required|access denied|request blocked|verify you are human/i.test(text);
+    }, undefined, { timeout: timeoutMs });
+  } catch (error) {
+    const challenge = await checkWafBlock(page);
+    if (challenge.blocked) throw Object.assign(new Error(challenge.reason, { cause: error }), { code: 'blocked' });
+    throw error;
   }
 }
 
-async function submitSearchAndParse(page) {
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: CONFIG.delays.searchTimeoutMs }).catch(() => {}),
-    page.locator('#btnCaseSearch').click(),
-  ]);
-  await page.waitForTimeout(2000);
-  await ensureTermsAccepted(page);
-  await assertSearchPageHealthy(page, 'Case search results');
-
-  return await parseSearchResults(page);
-}
-
-/**
- * Search Hearings by Judicial Officer, Date Range, Category, County.
- */
-export async function searchHearings(page, options = {}) {
-  const {
-    judgeName = '',
-    hearingDateFrom = '',
-    hearingDateTo = '',
-    hearingDateExact = true,
-    categories = [],
-    counties = [],
-  } = options;
-
-  console.log(`[HearingSearch] Searching: Judge="${judgeName}", Date="${hearingDateFrom}" to "${hearingDateTo}"...`);
-  await page.goto(CONFIG.urls.hearingSearch, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
-  await ensureTermsAccepted(page);
-  await assertSearchPageHealthy(page, 'Hearing search');
-
-  if (judgeName) {
-    const joTab = page.locator('#MpaHearingSearchJudicialOfficerTypeTab');
-    await joTab.click();
-    await page.waitForTimeout(500);
-    await page.locator('#JudicialOfficerName').fill(judgeName);
+export async function executeSearch(page, input) {
+  const query = validateSearchOptions(input);
+  if (query.sourceId && query.sourceId !== 'mn-mcro') throw new Error('Live search accepts only the mn-mcro source');
+  requireLiveMn();
+  const endpoint = { document: CONFIG.urls.documentSearch, hearing: CONFIG.urls.hearingSearch, judgment: new URL('JudgmentSearch', CONFIG.urls.caseSearch).href }[query.searchType] || CONFIG.urls.caseSearch;
+  await page.goto(endpoint, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
+  await assertSearchPageHealthy(page, 'Search'); await ensureTermsAccepted(page);
+  await applyQuery(page, query);
+  const buttonId = { document: '#btnFindCaseByNumber', judgment: '#btnJudgmentSearch', hearing: '#btnHearingSearch' }[query.searchType] || '#btnCaseSearch';
+  await page.locator(buttonId).click();
+  // MCRO changes the DOM without navigating. A navigation-only wait previously
+  // timed out on successful results and misclassified invalid hearing dates.
+  await waitForSearchResults(page);
+  await assertSearchPageHealthy(page, 'Search results'); await ensureTermsAccepted(page);
+  const validationErrors = await page.locator('.field-validation-error, .validation-summary-errors').allTextContents();
+  if (validationErrors.some((text) => text.trim())) throw Object.assign(new Error(`MCRO rejected search: ${validationErrors.join('; ')}`), { code: 'permanent' });
+  if (query.searchType === 'document') return parseDocumentSearchResults(page);
+  const result = await parseSearchResults(page);
+  if (query.caseNumber) {
+    if (result.cases.some((item) => !caseNumbersEqual(item.caseNumber, query.caseNumber))) throw new Error('MCRO returned non-matching case number');
   }
-
-  // Hearing Date
-  if (hearingDateFrom || hearingDateTo) {
-    if (!hearingDateExact || (hearingDateFrom && hearingDateTo && hearingDateFrom !== hearingDateTo)) {
-      await page.locator('#mpaHearingSearchHearingDateToggleRange').click().catch(() => {});
-      if (hearingDateFrom) await page.locator('#HearingDateFrom').fill(hearingDateFrom);
-      if (hearingDateTo) await page.locator('#HearingDateTo').fill(hearingDateTo);
-    } else {
-      await page.locator('#mpaHearingSearchHearingDateToggleOn').click().catch(() => {});
-      if (hearingDateFrom) await page.locator('#HearingDateFrom').fill(hearingDateFrom);
-    }
-  }
-
-  // Categories
-  if (categories && categories.length > 0) {
-    const advBtn = page.locator('#MpaAdditionalCriteriaHeader');
-    if (await advBtn.isVisible()) {
-      await advBtn.click();
-      await page.waitForTimeout(500);
-      for (const cat of categories) {
-        const cb = page.locator(`input[name="CaseCategoryKeys"][value="${cat.toUpperCase()}"]`);
-        if (await cb.isVisible().catch(() => false)) await cb.check();
-      }
-    }
-  }
-  if (counties && counties.length > 0) {
-    const resolved = counties.map((county) => ({ county, match: lookupCounty(county) }));
-    const invalid = resolved.filter(({ match }) => !match).map(({ county }) => county);
-    if (invalid.length > 0) throw new Error(`Unknown counties: ${invalid.join(', ')}`);
-    const codes = resolved.map(({ match }) => match.code);
-    await page.locator('#mpaLocOptionToggleCounty').click();
-    await page.evaluate((countyCodes) => {
-      for (const code of countyCodes) {
-        const input = document.querySelector(`input[name="Locations"][value="${code}"]`);
-        if (!input) throw new Error(`County control not found: ${code}`);
-        input.checked = true;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    }, codes);
-  }
-
-
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: CONFIG.delays.searchTimeoutMs }).catch(() => {}),
-    page.locator('#btnHearingSearch').click(),
-  ]);
-  await page.waitForTimeout(2000);
-  await ensureTermsAccepted(page);
-  await assertSearchPageHealthy(page, 'Hearing search results');
-
-  return await parseSearchResults(page);
+  return result;
 }
 
-/**
- * Direct DocumentSearch for Case Number.
- */
-export async function searchDocumentDirect(page, caseNumber) {
-  console.log(`[Search] Direct DocumentSearch for: "${caseNumber}"...`);
-  await page.goto(CONFIG.urls.documentSearch, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
-  await ensureTermsAccepted(page);
-  await assertSearchPageHealthy(page, 'Document search');
 
-  await page.locator('#CaseNumber').fill(caseNumber);
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: CONFIG.delays.searchTimeoutMs }).catch(() => {}),
-    page.locator('#btnFindCaseByNumber').click(),
-  ]);
-  await page.waitForTimeout(2000);
-  await ensureTermsAccepted(page);
-  await assertSearchPageHealthy(page, 'Document search results');
-
-  return await parseDocumentSearchResults(page);
-}
-
-/**
- * Backward compatibility helpers.
- */
-export async function searchByCaseNumber(page, caseNumber) {
-  return await searchCases(page, { caseNumber });
-}
-
-export async function searchByPartyName(page, options = {}) {
-  return await searchCases(page, options);
-}
-
-export async function searchByAttorney(page, options = {}) {
-  return await searchCases(page, {
-    attorneyLastName: options.lastName,
-    attorneyFirstName: options.firstName,
-    barNumber: options.barNumber,
-  });
-}
-
-/**
- * Parse results cards from CaseSearch.
- */
 export async function parseSearchResults(page) {
   const result = await page.evaluate(() => {
+    const bodyText = document.body.innerText;
     const wrapper = document.querySelector('#mpaCardsWrapper');
     if (!wrapper) {
-      const bodyText = document.body.innerText;
-      const noResults =
-        bodyText.includes('Your search returned no results') ||
-        bodyText.includes('No cases were found');
-      return { totalFound: 0, noResults, unexpected: !noResults, cases: [] };
+      const noResults = /Your search returned no results|No cases were found|No hearings were found|No judgments were found/i.test(bodyText);
+      return { totalFound: 0, noResults, unexpected: !noResults, cases: [], rawText: bodyText };
     }
-
-    const cards = Array.from(wrapper.children);
-    const parsed = cards.map((card, idx) => {
-      const hHeading = card.querySelector('h2, h3, h4, [class*="mpa-case-search-results-card-header"]');
-      const caseNumberRaw = hHeading ? hHeading.innerText.replace(/Case Number:\s*/i, '').trim() : '';
-
-      const detailsLink = card.querySelector('a.mpa-case-search-results-btn, a[href*="ViewCaseDetails"]');
-      const detailsHref = detailsLink ? detailsLink.href : null;
-
+    const cards = [...wrapper.children];
+    const cases = cards.map((card, index) => {
       const text = card.innerText;
-      function extractField(label) {
-        const regex = new RegExp(label + ':\\s*([^\\n]+)', 'i');
-        const match = text.match(regex);
-        return match ? match[1].trim() : '';
-      }
-
-      const dateFiled = extractField('Date Filed');
-      const caseTitle = extractField('Case Title');
-      const caseType = extractField('Case Type');
-      const caseLocation = extractField('Case Location');
-      const judicialOfficer = extractField('Judicial Officer');
-      const caseStatus = extractField('Case Status');
-      const citationNumber = extractField('Citation Number');
-
-      return {
-        index: idx + 1,
-        caseNumberRaw,
-        caseTitle,
-        caseType,
-        dateFiled,
-        caseLocation,
-        judicialOfficer,
-        caseStatus,
-        citationNumber,
-        detailsHref,
-        buttonSelector: `#mpaCardsWrapper > div:nth-child(${idx + 1}) a.mpa-case-search-results-btn`,
-      };
+      const extract = (label) => text.match(new RegExp(label + ':\\s*([^\\n]+)', 'i'))?.[1]?.trim() || '';
+      const heading = card.querySelector('h2, h3, h4, [class*="mpa-case-search-results-card-header"]');
+      const link = card.querySelector('a.mpa-case-search-results-btn, a[href*="ViewCaseDetails"]');
+      return { index: index + 1, caseNumberRaw: extract('Case Number') || heading?.innerText.replace(/Case Number:\s*/i, '').trim() || '', caseTitle: extract('Case Title'), caseType: extract('Case Type'), dateFiled: extract('Date Filed'), caseLocation: extract('Case Location'), judicialOfficer: extract('Judicial Officer'), caseStatus: extract('Case Status'), citationNumber: extract('Citation Number'), detailsHref: link?.href || null, rawText: text };
     });
-
-    return {
-      totalFound: parsed.length,
-      noResults: parsed.length === 0,
-      truncated: parsed.length >= 200,
-      unexpected: false,
-      cases: parsed,
-    };
+    const truncated = cases.length >= 200 || /(?:first|maximum|limited to)\s+200|more than 200|too many results/i.test(bodyText);
+    const hasNext = [...document.querySelectorAll('a, button')].some((node) => /^next(?: page)?$/i.test(node.textContent.trim()) && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true');
+    return { totalFound: cases.length, noResults: cases.length === 0, unexpected: cases.length === 0, truncated: truncated || hasNext, cases, rawText: bodyText };
   });
-  if (result.unexpected) {
-    throw new Error(`MCRO search results could not be recognized at ${page.url()}`);
-  }
-
-  result.cases = result.cases.map((c) => ({
-    ...c,
-    caseNumber: normalizeCaseNumber(c.caseNumberRaw),
-  }));
-
-  console.log(`[Search] Found ${result.cases.length} case(s).`);
+  if (result.unexpected) throw Object.assign(new Error(`MCRO search results could not be recognized at ${page.url()}`), { code: 'parse_error' });
+  result.cases = result.cases.map((item) => ({ ...item, caseNumber: normalizeCaseNumber(item.caseNumberRaw) }));
+  if (result.cases.some((item) => !/\d/.test(item.caseNumber))) throw Object.assign(new Error('MCRO result lacks a recognizable case number'), { code: 'parse_error' });
   return result;
 }
 
 export async function parseDocumentSearchResults(page) {
-  return await page.evaluate(() => {
-    const forms = Array.from(document.querySelectorAll('form[action*="DownloadDocument"]'));
-    const pageText = document.body.innerText;
-
-    function extractField(label) {
-      const regex = new RegExp(label + ':\\s*([^\\n]+)', 'i');
-      const match = pageText.match(regex);
-      return match ? match[1].trim() : '';
-    }
-
-    const caseNumberRaw = extractField('Case Number');
-    const caseTitle = extractField('Case Title');
-
-    const documents = forms.map((form, idx) => {
-      const parentRow = form.closest('.row, div.mb-2, [class*="document-item"]') || form.parentElement;
-      const rowText = parentRow ? parentRow.innerText : '';
-      const tokenInput = form.querySelector('input[name="DocumentDownloadToken"]');
-      const token = tokenInput ? tokenInput.value : '';
-
-      const pagesMatch = rowText.match(/(\d+)\s+pages?/i);
-      const pages = pagesMatch ? parseInt(pagesMatch[1], 10) : null;
-
-      const titleSpan = parentRow.querySelector('span[id*="event"], .mpa-document-title, strong');
-      const docTitle = titleSpan ? titleSpan.innerText.trim() : rowText.split('\n')[0].trim();
-
-      return {
-        index: idx + 1,
-        docTitle,
-        pages,
-        token,
-        formSelector: `form[action*="DownloadDocument"]:nth-of-type(${idx + 1})`,
-      };
+  const result = await page.evaluate(() => {
+    const text = document.body.innerText;
+    const extract = (label) => text.match(new RegExp(label + ':\\s*([^\\n]+)', 'i'))?.[1]?.trim() || '';
+    const documents = [...document.querySelectorAll('form[action*="DownloadDocument"]')].map((form, index) => {
+      const row = form.closest('.row, div.mb-2, [class*="document-item"]') || form.parentElement;
+      return { index: index + 1, docTitle: row?.innerText.trim() || '', pages: row?.innerText.match(/(\d+)\s+pages?/i)?.[1] || null, rawText: row?.innerText || '' };
     });
-
-    return {
-      caseNumberRaw,
-      caseTitle,
-      totalDocuments: documents.length,
-      documents,
-    };
+    return { caseNumberRaw: extract('Case Number'), caseTitle: extract('Case Title'), totalDocuments: documents.length, documents, rawText: text, noResults: /Your search returned no results|No cases were found/i.test(text) };
   });
+  if (!result.caseNumberRaw && !result.noResults) throw Object.assign(new Error('Document search response is unrecognized'), { code: 'parse_error' });
+  return result;
 }

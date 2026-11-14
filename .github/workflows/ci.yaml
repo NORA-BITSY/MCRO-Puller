@@ -1,0 +1,86 @@
+name: Platform CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: platform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-bookworm@sha256:40865bc877a289da75963d97d72b59633f639fc5af7a4e856bfa3714cae5b536
+        env:
+          POSTGRES_DB: court_test
+          POSTGRES_USER: court_test
+          POSTGRES_PASSWORD: ephemeral-ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U court_test -d court_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      COURT_DATABASE_URL: postgresql://court_test:ephemeral-ci-only@127.0.0.1:5432/court_test
+      COURT_TEST_DATABASE_URL: postgresql://court_test:ephemeral-ci-only@127.0.0.1:5432/court_test
+      COURT_ALLOW_LIVE_MN: "false"
+      COURT_STORAGE_DIR: /tmp/court-test-artifacts
+      API_TOKEN_READ: ephemeral-ci-read-only
+      API_TOKEN_WRITE: ephemeral-ci-write-only
+      API_TOKEN_ADMIN: ephemeral-ci-admin-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+      - name: Install pinned package manager and dependencies
+        run: npm install --global pnpm@12.18.0 && pnpm install --frozen-lockfile
+      - name: Install real PDF, OCR and browser tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-eng
+          pnpm exec playwright install --with-deps chromium
+      - run: pnpm typecheck
+      - run: pnpm build
+      - name: Apply migrations to real PostgreSQL twice (idempotency)
+        run: |
+          node dist/src/platform/courtctl.js db migrate
+          node dist/src/platform/courtctl.js db migrate
+      - name: Unit and real PostgreSQL integration tests
+        run: pnpm test
+      - name: Deployment contract and authenticated probe regression
+        run: node --test infra/tests/*.test.mjs
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Validate Terraform without credentials, plan or apply
+        run: terraform -chdir=infra init -backend=false && terraform -chdir=infra validate
+      - uses: docker/setup-buildx-action@v3
+      - name: Validate Compose and Dockerfile
+        env:
+          POSTGRES_PASSWORD: ephemeral-compose-only
+        run: docker compose config --quiet && docker buildx build --check .
+      - name: Build runnable image without publishing
+        run: docker build --tag court-platform:ci .
+      - name: Verify tools, browser and non-root runtime in built image
+        run: |
+          docker run --rm court-platform:ci sh -c 'test "$(id -u)" != 0 && pdfinfo -v && tesseract --version'
+          docker run --rm --shm-size=1g court-platform:ci node --input-type=module -e 'import {chromium} from "playwright"; const b = await chromium.launch({headless:true}); const p = await b.newPage(); await p.setContent("<title>offline fixture</title>"); if (await p.title() !== "offline fixture") throw new Error("browser smoke failed"); await b.close();'
+      - name: Verify authenticated HTTP readiness against PostgreSQL
+        run: |
+          docker run -d --name court-api-ci --network host \
+            -e COURT_DATABASE_URL -e API_TOKEN_READ -e API_TOKEN_WRITE -e API_TOKEN_ADMIN \
+            -e COURT_ALLOW_LIVE_MN=false court-platform:ci
+          for attempt in $(seq 1 30); do
+            if docker exec court-api-ci node infra/healthcheck.mjs; then break; fi
+            sleep 2
+          done
+          docker exec court-api-ci node infra/healthcheck.mjs
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3000/api/v1/health)" = 401
+      - name: Container failure diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs court-api-ci 2>/dev/null || true
+          docker rm -f court-api-ci 2>/dev/null || true

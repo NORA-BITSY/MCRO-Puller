@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { runNativeSync } from './native-tools.js';
 import os from 'node:os';
-import { processFilingToDossier } from './nlp.js';
+import { processFilingToDossier, classifyDocumentHeading } from './nlp.js';
 
 const TESSERACT_PATH = fs.existsSync('/opt/homebrew/bin/tesseract')
   ? '/opt/homebrew/bin/tesseract'
@@ -19,6 +19,11 @@ const PDFTOPPM_PATH = fs.existsSync('/opt/homebrew/bin/pdftoppm')
 const PDFINFO_PATH = fs.existsSync('/opt/homebrew/bin/pdfinfo')
   ? '/opt/homebrew/bin/pdfinfo'
   : 'pdfinfo';
+
+// Use the same pre-exec resource limits as acquisition/storage PDF validation.
+function runTool(binary, args, maxBuffer = 16 * 1024 * 1024) {
+  return runNativeSync(binary, args, { timeout: 60000, maxBuffer }).stdout;
+}
 function writeFileAtomic(filePath, contents) {
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -35,25 +40,18 @@ function writeFileAtomic(filePath, contents) {
  * Check if a PDF page has sufficient embedded digital text.
  */
 export function extractEmbeddedText(pdfPath) {
-  try {
-    const raw = execFileSync(PDFTOTEXT_PATH, [pdfPath, '-'], { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 });
-    const pages = raw.split('\f'); // Form feed separates pages in pdftotext
-    if (pages.length > 0 && pages[pages.length - 1].trim() === '') {
-      pages.pop();
-    }
-    return pages;
-  } catch (err) {
-    return [];
-  }
+  const raw = runTool(PDFTOTEXT_PATH, ['-layout', pdfPath, '-']);
+  const pages = raw.split('\f');
+  if (pages.at(-1)?.trim() === '') pages.pop();
+  return pages;
 }
 export function getPdfPageCount(pdfPath) {
   try {
-    const output = execFileSync(PDFINFO_PATH, [pdfPath], {
-      encoding: 'utf-8',
-      maxBuffer: 5 * 1024 * 1024,
-    });
+    const output = runTool(PDFINFO_PATH, [pdfPath], 1024 * 1024);
     const match = output.match(/^Pages:\s+(\d+)$/mi);
-    return match ? Number.parseInt(match[1], 10) : 0;
+    const count = match ? Number.parseInt(match[1], 10) : 0;
+    if (count < 1 || count > 2000) throw new Error('PDF page count outside supported range 1–2000');
+    return count;
   } catch (error) {
     throw new Error(`Unable to determine PDF page count for ${pdfPath}: ${error.message}`);
   }
@@ -64,41 +62,27 @@ export function getPdfPageCount(pdfPath) {
  * Perform OCR on a single scanned page image using Tesseract.
  */
 export function ocrImage(imagePath) {
-  const tmpOut = path.join(os.tmpdir(), `mcro_ocr_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-  try {
-    execFileSync(TESSERACT_PATH, [imagePath, tmpOut], { stdio: 'pipe' });
-    const txtPath = `${tmpOut}.txt`;
-    if (fs.existsSync(txtPath)) {
-      const text = fs.readFileSync(txtPath, 'utf-8');
-      try { fs.unlinkSync(txtPath); } catch (e) {}
-      return text;
-    }
-    return '';
-  } catch (err) {
-    console.warn(`[OCR] Tesseract error on ${imagePath}: ${err.message}`);
-    return '';
-  }
+  return runTool(TESSERACT_PATH, [imagePath, 'stdout', '-l', 'eng'], 1024 * 1024);
 }
 
 /**
  * Render specific PDF page(s) to PNG images using pdftoppm.
  */
 export function renderPageImages(pdfPath, firstPage, lastPage, dpi = 200) {
-  const tmpPrefix = path.join(os.tmpdir(), `mcro_page_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  if (!Number.isInteger(firstPage) || firstPage < 1 || lastPage !== firstPage) {
+    throw new Error('Raster extraction requires exactly one positive page number');
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'court-page-'));
+  const prefix = path.join(directory, 'page');
   try {
-    execFileSync(
-      PDFTOPPM_PATH,
-      ['-png', '-r', String(dpi), '-f', String(firstPage), '-l', String(lastPage), pdfPath, tmpPrefix],
-      { stdio: 'pipe' }
-    );
-    const dir = path.dirname(tmpPrefix);
-    const base = path.basename(tmpPrefix);
-    const matches = fs.readdirSync(dir).filter((f) => f.startsWith(base) && f.endsWith('.png'));
-    matches.sort();
-    return matches.map((f) => path.join(dir, f));
-  } catch (err) {
-    console.warn(`[OCR] pdftoppm error on ${pdfPath}: ${err.message}`);
-    return [];
+    runTool(PDFTOPPM_PATH, ['-gray', '-r', String(dpi), '-scale-to', '2400',
+      '-f', String(firstPage), '-l', String(lastPage), '-singlefile', pdfPath, prefix]);
+    const image = `${prefix}.pgm`;
+    if (!fs.existsSync(image)) throw new Error('Renderer did not produce a page image');
+    return [image];
+  } catch (error) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    throw error;
   }
 }
 
@@ -106,50 +90,67 @@ export function renderPageImages(pdfPath, firstPage, lastPage, dpi = 200) {
  * Hybrid Text Extractor: uses embedded vector text if present, falls back to Tesseract OCR for scanned pages.
  */
 export function extractPdfTextHybrid(pdfPath, options = {}) {
-  const minWordsPerPage = options.minWordsPerPage || 35;
-  const embeddedPages = extractEmbeddedText(pdfPath);
+  const minWordsPerPage = options.minWordsPerPage ?? 35;
   const reportedPages = getPdfPageCount(pdfPath);
-  const totalPages = Math.max(reportedPages, embeddedPages.length);
+  const embeddedPages = extractEmbeddedText(pdfPath);
+  const totalPages = reportedPages;
   if (totalPages < 1) throw new Error(`PDF has no readable pages: ${pdfPath}`);
 
   const finalPages = [];
   const warnings = [];
+  let extractedCharacters = 0;
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
     const pageText = embeddedPages[pageNum - 1] || '';
     const wordCount = pageText.split(/\s+/).filter(Boolean).length;
 
     if (wordCount >= minWordsPerPage) {
+      extractedCharacters += pageText.length;
+      if (extractedCharacters > 32 * 1024 * 1024) throw new Error('PDF extracted text exceeds 32 Mi characters');
       finalPages.push({
         pageNum,
         text: pageText,
         source: 'vector_text',
         wordCount,
+        quality: { status: 'text', wordCount },
       });
       continue;
     }
 
-    const images = renderPageImages(pdfPath, pageNum, pageNum, options.dpi || 200);
+    let images = [];
     let ocrText = '';
+    let failure = '';
+    let blank = false;
     try {
-      if (images.length > 0) ocrText = ocrImage(images[0]);
-    } finally {
-      for (const image of images) {
-        try { fs.unlinkSync(image); } catch {}
+      images = renderPageImages(pdfPath, pageNum, pageNum, options.dpi ?? 200);
+      // PGM pixels permit a conservative genuinely-white-page distinction.
+      const pixels = fs.readFileSync(images[0]);
+      const header = pixels.toString('ascii', 0, 200).match(/^P5\s+(?:#[^\n]*\n\s*)*(\d+)\s+(\d+)\s+255\s/);
+      if (header) {
+        const raster = pixels.subarray(header[0].length);
+        blank = raster.length === Number(header[1]) * Number(header[2]) && raster.every(value => value >= 250);
       }
+      ocrText = ocrImage(images[0]);
+    } catch (error) {
+      failure = error.message;
+      warnings.push(`Page ${pageNum} extraction failed: ${failure}`);
+    } finally {
+      for (const image of images) fs.rmSync(path.dirname(image), { recursive: true, force: true });
     }
-
-    const combinedText = [pageText.trim(), ocrText.trim()].filter(Boolean).join('\n\n');
-    const combinedWordCount = combinedText.split(/\s+/).filter(Boolean).length;
-    const source = ocrText
-      ? (pageText.trim() ? 'vector_text+tesseract_ocr' : 'tesseract_ocr')
-      : (pageText.trim() ? 'vector_text_sparse' : 'extraction_failed');
-    if (!combinedText) warnings.push(`Page ${pageNum} produced no vector text or OCR text`);
-
+    // Never concatenate the same vector words with their OCR duplicates.
+    const text = ocrText.trim().length > pageText.trim().length ? ocrText : pageText;
+    extractedCharacters += text.length;
+    if (extractedCharacters > 32 * 1024 * 1024) throw new Error('PDF extracted text exceeds 32 Mi characters');
+    const source = failure ? (text.trim() ? 'vector_text_sparse' : 'extraction_failed')
+      : text.trim() ? (text === ocrText ? 'tesseract_ocr' : 'vector_text_sparse')
+      : blank ? 'blank' : 'unreadable';
+    if (source === 'unreadable') warnings.push(`Page ${pageNum} has visible content but no recognized text`);
     finalPages.push({
       pageNum,
-      text: combinedText,
+      text,
       source,
-      wordCount: combinedWordCount,
+      wordCount: text.split(/\s+/).filter(Boolean).length,
+      quality: { status: failure ? 'failed' : source === 'blank' ? 'blank' : source === 'unreadable' ? 'unreadable' : 'text',
+        ...(failure ? { error: failure } : {}) },
     });
   }
 
@@ -181,9 +182,8 @@ export function parseStructuredLegalEntities(fullText) {
   const judicialDistrict = districtMatch ? districtMatch[1].trim() : null;
 
   // 3. Document Title (e.g. COMPLAINT, SUMMONS, AFFIDAVIT, NOTICE, ORDER)
-  const docTitleRegex = /\b(COMPLAINT|SUMMONS|AFFIDAVIT OF [A-Z\s]+|NOTICE OF [A-Z\s]+|CIVIL COVER SHEET|ORDER FOR [A-Z\s]+|ANSWER AND COUNTERCLAIM|MOTION FOR [A-Z\s]+|PETITION FOR [A-Z\s]+)\b/i;
-  const titleMatch = fullText.match(docTitleRegex);
-  const documentTitle = titleMatch ? titleMatch[1].trim().toUpperCase() : null;
+  const heading = classifyDocumentHeading(fullText);
+  const documentTitle = heading.evidence || null;
 
   // 4. Bar Numbers & Attorneys (MN License format e.g. "Atty Reg. No. 0392011" or "Bar No. 0123456")
   const barNumbers = [];
