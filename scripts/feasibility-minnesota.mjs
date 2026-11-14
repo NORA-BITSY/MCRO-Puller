@@ -490,10 +490,15 @@ if (!process.argv.includes('--crash-worker')) {
         liveStatus = `error: ${err.message}`;
       }
 
-      console.log(`  - Probing production MinnesotaAdapter against live portal...`);
+      // Operator-approved proxy routing: if COURT_PROXIES is set, the live probe
+      // egresses through the first Decodo sticky session (US exit IP).
+      const courtProxies = (process.env.COURT_PROXIES || '').split(',').map((entry) => entry.trim()).filter(Boolean);
+      const proxy = process.env.COURT_PROXY || courtProxies[0];
+      console.log(`  - Probing production MinnesotaAdapter against live portal${proxy ? ` via proxy ${proxy.replace(/\/\/.*@/, '//')}` : ''}...`);
       const liveAdapter = new MinnesotaAdapter('standalone', {
         headed: process.env.COURT_BROWSER_HEADED === 'true',
         sessionPath: sessionFile,
+        proxy,
       });
 
       let searchResult = null;

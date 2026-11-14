@@ -175,13 +175,37 @@ async function createStandaloneClient(options = {}) {
 
   const headed = options.headed ?? (process.env.COURT_BROWSER_HEADED === 'true');
   const sessionPath = options.sessionPath || process.env.COURT_SESSION_FILE || CONFIG.sessionFile;
-  const storageState = fs.existsSync(sessionPath) ? sessionPath : undefined;
+  let storageState = fs.existsSync(sessionPath) ? sessionPath : undefined;
   const executablePath = options.executablePath || findSystemChrome();
 
+  // F5 ASM cookies are bound to the exit IP that earned them. When egressing
+  // through a proxy, stale home-IP F5 cookies read as a mismatch and the POST
+  // gets rejected; drop them so F5 reissues fresh cookies for the proxy IP.
+  if (storageState && options.proxy) {
+    const state = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const before = state.cookies?.length || 0;
+    state.cookies = (state.cookies || []).filter((cookie) => !/^(TS\d+[a-f0-9]*|OClmoOot|visid_incap|nlbi_|__cf_bm)$/i.test(cookie.name));
+    console.log(`[Browser] Proxied context: dropped ${before - state.cookies.length} IP-bound WAF cookie(s) for fresh issuance`);
+    storageState = state;
+  }
   // Operator-approved proxy routing: each concurrent worker may pin its own
   // proxy (sticky by worker index) so no single exit IP carries the full load.
   const proxy = options.proxy || undefined;
-  const proxyOption = typeof proxy === 'string' ? { server: proxy } : proxy;
+  // Accept "http://user:pass@host:port" strings or {server, username,
+  // password} objects. Chromium rejects embedded userinfo in `server`
+  // (ERR_INVALID_AUTH_CREDENTIALS), so split them into separate fields.
+  const proxyOption = typeof proxy === 'string' && /^https?:\/\//.test(proxy)
+    ? (() => {
+        const url = new URL(proxy);
+        return {
+          server: `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ''}`,
+          ...(url.username ? { username: decodeURIComponent(url.username) } : {}),
+          ...(url.password ? { password: decodeURIComponent(url.password) } : {}),
+        };
+      })()
+    : typeof proxy === 'string'
+      ? { server: proxy }
+      : proxy;
   console.log(`[Browser] Launching standard Chromium (headed: ${headed}, executable: ${executablePath || 'default'}${proxyOption ? `, proxy: ${proxyOption.server}` : ''})...`);
   const browser = await chromium.launch({
     headless: !headed,

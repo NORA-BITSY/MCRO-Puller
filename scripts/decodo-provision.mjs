@@ -2,12 +2,14 @@
 /**
  * Decodo Residential proxy pool provisioner.
  *
- * Requires an active Decodo Residential subscription. Uses the account Public
- * API key to ensure a dedicated proxy sub-user exists, then materializes the
- * sticky per-worker proxy pool as COURT_PROXIES (written to the gitignored
- * .runtime/decodo.env) and verifies each session's egress.
+ * Uses the operator's dashboard proxy user (DECODO_SUB_USERNAME/DECODO_SUB_PASSWORD)
+ * to materialize 10 sticky US sessions as COURT_PROXIES (written to the
+ * gitignored .runtime/decodo.env, mode 0600) and verifies each session's
+ * egress. Sessions are port-based sticky endpoints on us.decodo.com
+ * (10001-29999): one port per worker, US exit IPs, never rotated mid-session.
  *
- *   node scripts/decodo-provision.mjs            # provision + verify egress
+ * Usage:
+ *   node scripts/decodo-provision.mjs            # verify egress + persist pool
  *   node scripts/decodo-provision.mjs --check    # verify egress only
  */
 import { readFileSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
@@ -20,7 +22,7 @@ const envPath = process.env.DECODO_ENV_FILE || path.join(process.cwd(), '.runtim
 
 function loadEnv() {
   if (!existsSync(envPath)) {
-    throw new Error(`Decodo env file not found: ${envPath}. Expected DECODO_API_KEY, DECODO_SUB_USERNAME, DECODO_SUB_PASSWORD.`);
+    throw new Error(`Decodo env file not found: ${envPath}. Expected DECODO_SUB_USERNAME, DECODO_SUB_PASSWORD.`);
   }
   const env = {};
   for (const line of readFileSync(envPath, 'utf8').split('\n')) {
@@ -31,55 +33,18 @@ function loadEnv() {
 }
 
 const SESSIONS = Number.parseInt(process.env.DECODO_SESSIONS || '10', 10);
-const COUNTRY = process.env.DECODO_COUNTRY || 'us';
-const DURATION_MIN = Number.parseInt(process.env.DECODO_SESSION_DURATION || '120', 10);
+const STICKY_HOST = process.env.DECODO_STICKY_HOST || 'us.decodo.com';
+const STICKY_PORT_BASE = Number.parseInt(process.env.DECODO_STICKY_PORT_BASE || '10000', 10);
 
 function buildPool(env) {
   const username = env.DECODO_SUB_USERNAME;
   const password = env.DECODO_SUB_PASSWORD;
   if (!username || !password) throw new Error('DECODO_SUB_USERNAME and DECODO_SUB_PASSWORD are required');
-  // One proxy user; each worker gets a distinct sticky session ID in the
-  // username string (Decodo backconnect parameter model).
+  // Port-based sticky: each port is its own session with a stable US exit IP.
   return Array.from({ length: SESSIONS }, (_, i) => {
-    const user = `user-${username}-country-${COUNTRY}-session-mcro-w${i + 1}-sessionduration-${DURATION_MIN}`;
-    return `http://${encodeURIComponent(user)}:${encodeURIComponent(password)}@gate.decodo.com:7000`;
+    const port = STICKY_PORT_BASE + i + 1;
+    return `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${STICKY_HOST}:${port}`;
   });
-}
-
-async function api(key, pathname, init) {
-  const response = await fetch(`https://api.decodo.com${pathname}`, {
-    ...init,
-    headers: { Authorization: key, 'Content-Type': 'application/json', ...(init?.headers || {}) },
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok && body.error_code === 'unauthorized') {
-    throw new Error('Decodo Public API rejected DECODO_API_KEY (unauthorized)');
-  }
-  return { ok: response.ok, status: response.status, body };
-}
-
-async function ensureSubUser(env) {
-  const list = await api(env.DECODO_API_KEY, '/v2/sub-users?service_type=residential_proxies');
-  if (!list.ok) throw new Error(`Cannot read Decodo sub-users (HTTP ${list.status}): ${JSON.stringify(list.body)}`);
-  if (Array.isArray(list.body) && list.body.some((user) => user.username === env.DECODO_SUB_USERNAME)) {
-    console.log(`[Decodo] Sub-user "${env.DECODO_SUB_USERNAME}" already exists.`);
-    return;
-  }
-  const created = await api(env.DECODO_API_KEY, '/v2/sub-users', {
-    method: 'POST',
-    body: JSON.stringify({
-      username: env.DECODO_SUB_USERNAME,
-      password: env.DECODO_SUB_PASSWORD,
-      service_type: 'residential_proxies',
-    }),
-  });
-  if (!created.ok && created.status !== 201) {
-    throw new Error(
-      `Sub-user creation failed (HTTP ${created.status}): ${JSON.stringify(created.body)}. ` +
-      'Most common cause: no active Residential subscription on the Decodo account (start the trial at dashboard.decodo.com → Residential).',
-    );
-  }
-  console.log(`[Decodo] Sub-user "${env.DECODO_SUB_USERNAME}" created.`);
 }
 
 async function checkEgress(pool) {
@@ -87,9 +52,12 @@ async function checkEgress(pool) {
   for (const [index, proxy] of pool.entries()) {
     try {
       const { stdout } = await run('curl', ['-sS', '-m', '45', '-x', proxy, 'https://ip.decodo.com/json'], { maxBuffer: 1024 * 1024 });
-      const ip = JSON.parse(stdout)?.proxy?.ip;
+      const parsed = JSON.parse(stdout);
+      const ip = parsed?.proxy?.ip;
+      const country = parsed?.country?.code;
       if (!ip) throw new Error(`no IP in response: ${stdout.slice(0, 120)}`);
-      console.log(`[Decodo] Session w${index + 1}: egress OK via ${ip}`);
+      if (country !== 'US') throw new Error(`non-US egress (${country})`);
+      console.log(`[Decodo] Session w${index + 1}: egress OK via ${ip} (${country})`);
     } catch (error) {
       failures++;
       console.error(`[Decodo] Session w${index + 1}: FAILED (${error.message})`);
@@ -103,24 +71,19 @@ function persistPool(pool) {
   const stripped = existing.replace(/^COURT_PROXIES=.*$/m, '').replace(/\n{3,}/g, '\n\n').trimEnd();
   writeFileSync(envPath, `${stripped}\nCOURT_PROXIES=${pool.join(',')}\n`);
   chmodSync(envPath, 0o600);
-  console.log(`[Decodo] ${pool.length} sticky sessions written to ${envPath} as COURT_PROXIES`);
+  console.log(`[Decodo] ${pool.length} sticky US sessions written to ${envPath} as COURT_PROXIES`);
   console.log('[Decodo] Run with: set -a && source .runtime/decodo.env && set +a && COURT_ALLOW_LIVE_MN=true pnpm live:mn');
 }
 
 const env = loadEnv();
 const checkOnly = process.argv.includes('--check');
-if (!env.DECODO_API_KEY || !env.DECODO_SUB_USERNAME || !env.DECODO_SUB_PASSWORD) {
-  throw new Error('DECODO_API_KEY, DECODO_SUB_USERNAME and DECODO_SUB_PASSWORD are required in ' + envPath);
-}
-
-if (checkOnly) {
-  const failures = await checkEgress(buildPool(env));
-  process.exit(failures ? 1 : 0);
-}
-
-await ensureSubUser(env);
 const pool = buildPool(env);
 const failures = await checkEgress(pool);
+if (failures === pool.length) {
+  console.error('[Decodo] All sessions failed — check DECODO_SUB_USERNAME/DECODO_SUB_PASSWORD and the Residential subscription.');
+  process.exit(3);
+}
+if (checkOnly) process.exit(failures ? 1 : 0);
 if (failures) {
   console.error(`[Decodo] ${failures}/${pool.length} sessions failed egress verification; pool not persisted.`);
   process.exit(1);

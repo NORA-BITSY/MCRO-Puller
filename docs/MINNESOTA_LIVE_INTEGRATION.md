@@ -100,7 +100,17 @@ With operator approval, the F5 BIG-IP ASM bot-mitigation interception of Gate L2
 ### Experiment E: Operator-Approved Automation Envelope (Proxy Pool & Concurrency)
 - **Concurrency:** `WorkerQueue` runs up to 10 concurrent pull jobs (hard ceiling `MAX_PULL_CONCURRENCY`; `MCRO_CONCURRENCY` env, default 10). Cases already in flight when a source-wide challenge fires are durably retained for retry; no new case starts after a block.
 - **Proxy pool:** `COURT_PROXIES` (comma-separated) or `COURT_PROXY` (single). Each worker is **stickily** assigned one pool proxy by worker index so F5/session cookies stay bound to one exit IP per worker; proxies are never rotated mid-session. Empty pool means direct connections.
-- **Decodo integration (`scripts/decodo-provision.mjs`, `pnpm decodo:mn`):** Provisions a dedicated Decodo Residential proxy sub-user via the account Public API key, materializes 10 distinct sticky US sessions (one per worker, 2-hour duration), verifies each session's egress, and persists the pool as `COURT_PROXIES` in the gitignored `.runtime/decodo.env` (mode `0600`). `pnpm decodo:check` re-verifies egress only. Requires an active Decodo Residential subscription (trial start: dashboard.decodo.com → Residential).
+- **Decodo integration (`scripts/decodo-provision.mjs`, `pnpm decodo:mn`):** Uses the operator's dashboard Decodo Residential proxy user to materialize 10 sticky **US** sessions on `us.decodo.com:10001-10010` (one port per worker; `gate.decodo.com` sticky ports are random-country and unsuitable for MCRO), verifies each session's US egress, and persists the pool as `COURT_PROXIES` in the gitignored `.runtime/decodo.env` (mode `0600`). `pnpm decodo:check` re-verifies egress only. Requires an active Decodo Residential subscription.
+- **Single proxied live pass:** one live search and document download succeeded through a Decodo US sticky session: 9 entries and a 467,436-byte PDF. This proves that individual acquisition, not repeatability or ten-worker throughput; the corrected initial batch below was blocked.
+- **Proxy handling (`src/browser.js`):** proxied contexts omit selected WAF cookies from imported state and supply Chromium credentials as separate Playwright fields. One subsequent pull succeeded, but the assertion that F5 cookies are IP-bound remains [INFERENCE], not a controlled finding. Later WAF rejections show that cookie filtering is not a reliable source-access solution.
+
+### Experiment F: Corrected Initial Criminal-Case Batch
+- **Targets:** `22-CR-26-####` (four-digit suffixes) and `46-CR-26-###` (three-digit suffixes). `46-CR-26-22222` is excluded; the superseded probe was cancelled and removed.
+- **Initial candidates:** `22-CR-26-1000` through `1004` and `46-CR-26-100` through `104`. These are candidates, not verified existing records. Fresh state/output paths prevent unrelated pending targets from being resumed.
+- **Execution:** actual `WorkerQueue` docket/PDF acquisition, ten standalone headed clients assigned to the ten US proxy endpoints, existing pacing and consent checks retained. After the bulk CLI returned a blocked status without per-case details, a landing-page diagnostic succeeded on proxy 1. An evidence-preserving resume used that landing warm-up and saved individual outcomes.
+- **Observed result:** zero successful acquisitions; two WAF rejections, five terms/session blocks, and three jobs stopped before acquisition. All ten candidates remain pending; no inference about case existence or absence is supported by these blocked responses.
+- **Retained evidence:** `.runtime/initial-pulls-2026-11-14T11-23-50-250Z/{candidates.json,scope.json,landing-diagnostic.json,results.json,state.json}`. No automatic terms acceptance or further challenge retries were performed. Repeatability remains unproven.
+
 
 ---
 
@@ -134,11 +144,12 @@ The operator session is imported and verified (`~/.mcro-puller/session.json`, mo
 ```sh
 export COURT_ALLOW_LIVE_MN=true
 # Option A — Decodo pool (requires active Residential subscription):
-#   pnpm decodo:mn        # creates sub-user, verifies 10 sticky sessions, writes COURT_PROXIES
+#   pnpm decodo:mn        # verifies proxy credentials and US egress; writes COURT_PROXIES
 #   set -a && source .runtime/decodo.env && set +a
 # Option B — manual proxy list (up to 10, one sticky proxy per worker):
 export COURT_PROXIES="http://proxy1:8080,http://proxy2:8080,..."
 pnpm live:mn          # bounded live pilot (search + document proof)
+```
 Concurrent case pulls (up to 10 workers, one sticky proxy each) use the `WorkerQueue` (`src/queue.js`); cooperative jitter pacing still applies between requests per worker, and a source-wide challenge pauses the whole queue while durably retaining pending work.
 
 To clear/revoke the local session file:
