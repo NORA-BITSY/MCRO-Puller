@@ -1,0 +1,62 @@
+{
+  "sourceId": "mn-mcro",
+  "adapterVersion": "1.0.0",
+  "verification": "documented",
+  "liveExecutionVerifiedForThisVersion": false,
+  "liveOptIn": "COURT_ALLOW_LIVE_MN=true",
+  "researchDate": "2026-11-13",
+  "authority": "Minnesota State Court Administrator's Office",
+  "sources": [
+    {"mode": "case/person/business/attorney", "published": "2022-08-05", "url": "https://mncourts.gov/_media/migration/mcro/qrg-searching-for-cases-in-mcro.pdf"},
+    {"mode": "hearing", "published": "2022-08-05", "url": "https://mncourts.gov/_media/migration/mcro/qrg-searching-for-hearings-in-mcro.pdf"},
+    {"mode": "judgment", "published": "2022-08-05", "url": "https://mncourts.gov/_media/migration/mcro/qrg-e28093-searching-for-judgments-in-mcro.pdf"},
+    {"mode": "document", "published": "2022-08-05", "url": "https://mncourts.gov/_media/migration/mcro/qrg-searching-for-documents-in-mcro.pdf"},
+    {"mode": "limitations", "url": "https://mncourts.gov/access-case-records/mcro/faqs"}
+  ],
+  "modes": {
+    "case": {"oneOf": ["caseNumber", "citationNumber"], "additionalFilters": false},
+    "party": {"required": ["lastName", "firstName"], "optional": ["middleName", "soundex", "dobFrom", "dobTo", "filedFrom", "filedTo", "status", "categories", "county", "counties"]},
+    "business": {"required": ["businessName"], "optional": ["soundex", "filedFrom", "filedTo", "status", "categories", "county", "counties"]},
+    "attorney": {"oneOf": [["attorneyLastName", "attorneyFirstName"], ["barNumber"]], "optional": ["attorneyMiddleName", "soundex", "filedFrom", "filedTo", "status", "categories", "county", "counties"]},
+    "document": {"required": ["caseNumber"], "additionalFilters": false},
+    "hearing": {"required": ["hearingFrom"], "oneOf": [["lastName", "firstName"], ["businessName"], ["caseNumber"], ["judgeName"], ["attorneyLastName", "attorneyFirstName"], ["barNumber"]], "optional": ["middleName", "attorneyMiddleName", "soundex", "hearingTo", "categories", "county", "counties"], "caseNumberRestrictions": "Only hearing date criteria apply to case-number hearing search."},
+    "judgment": {"oneOf": [["lastName", "firstName"], ["businessName"]], "optional": ["middleName", "soundex", "docketedFrom", "docketedTo", "judgmentStatus", "county", "counties"]}
+  },
+  "semantics": [
+    "Unknown and mode-incompatible fields fail before navigation; first/last name are both required.",
+    "Asterisk wildcard requires at least two leading characters; wildcard and Sounds Like cannot be combined.",
+    "Dates use valid ISO YYYY-MM-DD at the boundary, converted to the observed control's native format. A single date selects On; two differing dates select Range.",
+    "Case identity must match the requested nonempty case number; re-acquired document identity must be unique, never ordinal.",
+    "Every observed ROA content section retains source label and sanitized text; non-document events and multiple attachments are retained.",
+    "Hidden form tokens remain ephemeral for acquisition and are removed from persisted observations.",
+    "The 200-result cap or an unconsumed next page makes discovery incomplete. No universal statewide coverage claim.",
+    "Name-based searches do not expose pending criminal matters; absence is not proof of nonexistence.",
+    "Document index numbers may exist without attachments. Restricted public-record availability is not a download failure to bypass.",
+    "Visible CAPTCHA/challenge blocks stop acquisition. Standard Playwright only; no stealth plugin, proxies, or identity cycling.",
+    "Isolated BrowserContext routing budgets every source-origin document, XHR and fetch request, including the initial request of a popup. Stylesheets, fonts and images are excluded. Missing interception support fails explicitly; HTTP 403/429 latches a block, including requests awaiting a budget, and preserves Retry-After.",
+    "Legacy CLI uses the configured minimum request interval without a database callback. Standalone and extension paths create owned contexts with serviceWorkers blocked. Extension isolation is attempted through its CDP Browser.newContext API; actual unsupported failures are explicit and never fall back to the operator's shared context.",
+    "Result-readiness timeouts inspect visible CAPTCHA/challenge state before propagating the original timeout; HTTP-200 challenge pages become blocked rather than retryable timeouts.",
+    "Legacy search CLI uses canonical query validation, including --attorney-first/--attorney-middle and --search-type document|judgment|hearing. Proxy flags and proxy-test have been removed.",
+    "Legacy statewide requires --query JSON containing a validated source criterion. Filter-only enumeration is rejected before opening a browser; narrowed partition completeness is not statewide record coverage."
+  ],
+  "historicalEvidence": {
+    "basis": "Preserved baseline session, reviewed through DecodedHistory consult; not a new portal run.",
+    "observedSelectors": ["#MpaCaseSearchNameTypeTab", "#MpaCaseSearchCaseNumberTypeTab", "#MpaCaseSearchCitationNumberTypeTab", "#MpaCaseSearchAttorneyTypeTab", "#MpaCaseSearchAttyTypeNameTab", "#LastName", "#FirstName", "#MiddleName", "#Soundex", "#CaseSearchNumber", "#MpaAdditionalCriteriaHeader", "#MpaAdditionalCriteriaWraper", "#DobFrom", "#DobTo", "#FiledDateFrom", "#FiledDateTo", "#CaseStatus", "#JudicialOfficerName", "#HearingDateFrom", "#HearingDateTo", "#DocketedDateFrom", "#DocketedDateTo", "#JudgmentStatus", "#btnJudgmentSearch", "#mpaCardsWrapper", "#CaseNumber", "#btnFindCaseByNumber"],
+    "cautions": ["Case transitions changed DOM without URL navigation.", "Earlier hearing zero-result interpretation was invalid: the source displayed a date validation error.", "Event DOM position differed from source docket index; first event-prefix match was hidden date text, not title.", "No successful historical attorney, citation, business, hearing or judgment query was established."]
+  },
+  "browserIsolationEvidence": {
+    "sources": ["https://playwright.dev/docs/api/class-browsertype#browser-type-connect-over-cdp", "https://playwright.dev/docs/api/class-browser#browser-new-context"],
+    "installedBridge": "playwriter/src/relay-client.ts:584-684 returns a Browser via chromium.connectOverCDP. The inspected relay dispatch did not establish a blanket prohibition of Target.createBrowserContext.",
+    "verification": "Documentation and installed-source review only; no live extension/context probe performed.",
+    "policy": "Attempt one owned context per client; retain it across operations; never create replacement identities in response to source blocking."
+  },
+  "independentFixture": {
+    "sourceId": "independent-fixture",
+    "state": "ZZ",
+    "realJurisdiction": false,
+    "dataset": "test/fixtures/adapters/independent.json",
+    "artifacts": ["test/fixtures/adapters/petition.pdf", "test/fixtures/adapters/exhibit.pdf"],
+    "scenarios": ["query-bound cursor pagination", "different opaque case/event/attachment IDs", "descending source order", "non-document events", "multiple attachments", "restricted attachment", "missing case", "cancellation"],
+    "notice": "Synthetic documents and records only. Valid generated PDF artifacts are not real court filings. Soundex is fixture-only and does not reproduce Minnesota's proprietary matching."
+  }
+}
