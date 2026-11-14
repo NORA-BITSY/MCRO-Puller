@@ -291,3 +291,38 @@ test('R003-6: Session verification checks modal dismissal, cookies, and search a
   assert.equal(usableResult.hasSessionCookie, true);
   assert.equal(usableResult.usable, true);
 });
+test('R003-2: Gate L2 requires the exact target and a complete matching docket', () => {
+  const incomplete = evaluateLiveGates({
+    targetCaseNumber: '67-CV-26-300',
+    searchResults: [{ caseNumber: '67-CV-26-300' }],
+    caseObservation: { caseNumber: '67-CV-26-300', complete: false, entries: [{ documents: [] }] },
+  });
+  assert.match(incomplete.L2_live_source_search, /^(pending|partial)/);
+  assert.doesNotMatch(incomplete.L2_live_source_search, /^passed/);
+
+  const mismatchedDocket = evaluateLiveGates({
+    targetCaseNumber: '67-CV-26-300',
+    searchResults: [{ caseNumber: '67-CV-26-300' }],
+    caseObservation: { caseNumber: '27-CV-24-1', complete: true, entries: [{ documents: [] }] },
+  });
+  assert.notMatch(mismatchedDocket.L2_live_source_search, /^passed/);
+});
+
+test('R003-2: Gate L4 rejects a repeat observation for another case', () => {
+  const result = evaluateLiveGates({
+    targetCaseNumber: '67-CV-26-300',
+    searchResults: [{ caseNumber: '67-CV-26-300' }],
+    caseObservation: { caseNumber: '67-CV-26-300', complete: true, entries: [{ documents: [] }] },
+    documentObservation: { filename: 'petition.pdf', bytes: Buffer.from('%PDF-1.4\\n%%EOF') },
+    repeatObservation: { caseNumber: '27-CV-24-1' },
+  });
+  assert.doesNotMatch(result.L4_repeatability, /^passed/);
+});
+
+test('R003-6: A cookie file without terms, session and usable search state is not verified', async () => {
+  const result = await validateSessionPage(
+    { locator: () => ({ isVisible: async () => false, count: async () => 1 }) },
+    { cookies: async () => [{ name: 'unrelated', value: 'synthetic' }] },
+  );
+  assert.equal(result.usable, false);
+});
