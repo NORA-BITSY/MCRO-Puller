@@ -1,11 +1,11 @@
 import { CONFIG } from './config.js';
 import { createBrowserClient } from './browser.js';
-import { crawlCase, loadState, saveState } from './crawler.js';
+import { crawlCase } from './crawler.js';
 import { sleepJitter } from './waf.js';
 
 export class WorkerQueue {
   constructor(options = {}) {
-    this.concurrency = options.concurrency || 1;
+    this.concurrency = Number.isInteger(options.concurrency) && options.concurrency > 0 ? options.concurrency : 1;
     this.proxyManager = options.proxyManager || null;
     this.mode = options.mode || (this.proxyManager && this.proxyManager.proxies.length > 0 ? 'standalone' : 'extension');
     this.headed = options.headed || false;
@@ -52,9 +52,13 @@ export class WorkerQueue {
     }
 
     await Promise.all(workers);
-    console.log(
-      `[Queue] All workers completed: ${this.completedCount} succeeded, ${this.failedCount} failed.`
-    );
+    const summary = {
+      succeeded: this.completedCount,
+      failed: this.failedCount,
+      stopped: this.isStopping,
+    };
+    console.log(`[Queue] All workers completed: ${summary.succeeded} succeeded, ${summary.failed} failed.`);
+    return summary;
   }
 
   async spawnWorker(workerId) {
@@ -63,8 +67,14 @@ export class WorkerQueue {
       if (!caseNumber) break;
 
       let proxy = null;
-      if (this.proxyManager) {
+      if (this.proxyManager && this.proxyManager.proxies.length > 0) {
         proxy = this.proxyManager.getNextAvailableProxy();
+        if (!proxy) {
+          this.failedCount++;
+          console.error(`[Worker ${workerId}] No healthy proxy is available; stopping rather than falling back to the direct IP.`);
+          this.isStopping = true;
+          break;
+        }
       }
 
       console.log(`[Worker ${workerId}] Processing case: ${caseNumber} (proxy: ${proxy ? proxy.server : 'direct'})`);

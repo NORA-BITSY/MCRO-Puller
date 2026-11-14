@@ -90,9 +90,7 @@ export class ProxyManager {
       return candidate;
     }
 
-    // All are quarantined - pick the one with earliest expiration
-    const sorted = [...this.proxies].sort((a, b) => a.quarantinedUntil - b.quarantinedUntil);
-    return sorted[0];
+    return null;
   }
 
   reportSuccess(proxy) {

@@ -1,11 +1,9 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { CONFIG } from './config.js';
-import { loadState, saveState } from './crawler.js';
 import { searchByCaseNumber } from './search.js';
 import { navigateToCaseDetails } from './roa.js';
 import { downloadAllCaseDocuments } from './downloader.js';
-import { sleepJitter, normalizeCaseNumber } from './waf.js';
+import { resolveCaseOutputDir } from './crawler.js';
+import { buildCaseStateRecord, loadState, updateState } from './state.js';
+import { caseNumbersEqual, sleepJitter, normalizeCaseNumber } from './waf.js';
 
 /**
  * Check and incrementally update a single case.
@@ -16,56 +14,37 @@ export async function syncCase(browserClient, caseNumber, options = {}) {
   console.log(`\n[Sync] Checking case for updates: ${normCase}...`);
 
   const page = browserClient.page;
-  const state = loadState();
-  const existingRecord = state.pulledCases[normCase] || null;
-
-  // Search case to get ROA
   const searchResult = await searchByCaseNumber(page, normCase);
   if (!searchResult.cases || searchResult.cases.length === 0) {
     console.warn(`[Sync] Case ${normCase} not found in search results.`);
     return { updated: false, reason: 'not_found' };
   }
 
-  const caseItem = searchResult.cases[0];
-  const roaData = await navigateToCaseDetails(page, caseItem);
-
-  const availableDocCount = roaData.documentEventsCount;
-  const prevDownloaded = existingRecord ? existingRecord.downloadedCount || 0 : 0;
-
-  console.log(`[Sync] Case ${normCase}: ${availableDocCount} online docs vs ${prevDownloaded} previously downloaded.`);
-
-  if (existingRecord && availableDocCount <= prevDownloaded && !options.force) {
-    console.log(`  ✓ [Up to date] No new documents found for ${normCase}.`);
-    // Touch timestamp
-    existingRecord.lastCheckedAt = new Date().toISOString();
-    saveState(state);
-    return { updated: false, newDocs: 0 };
+  const caseItem = searchResult.cases.find((item) => caseNumbersEqual(item.caseNumber, normCase));
+  if (!caseItem) {
+    throw new Error(`Search returned results but no exact case-number match for ${normCase}`);
   }
 
-  // New documents exist! Run delta download (already existing files are skipped automatically)
-  console.log(`  ⚡ [Update Found] Downloading new documents for ${normCase}...`);
+  const roaData = await navigateToCaseDetails(page, caseItem);
+  const canonicalCase = roaData.caseInfo.caseNumber || caseItem.caseNumber;
+  console.log(`[Sync] Verifying ${roaData.documentEventsCount} public document(s) for ${canonicalCase}.`);
+
   const downloadSummary = await downloadAllCaseDocuments(page, roaData, {
     ...options,
-    force: false, // ensures already downloaded files are skipped!
+    outputDir: resolveCaseOutputDir(canonicalCase, options),
+    force: false,
   });
 
-  state.pulledCases[normCase] = {
-    status: downloadSummary.failures.length === 0 ? 'complete' : 'partial',
-    caseTitle: roaData.caseInfo.caseTitle,
-    caseType: roaData.caseInfo.caseType,
-    dateFiled: roaData.caseInfo.dateFiled,
-    totalDocuments: downloadSummary.totalDocuments,
-    downloadedCount: (existingRecord?.downloadedCount || 0) + downloadSummary.downloaded.length,
-    skippedCount: downloadSummary.skipped.length,
-    failureCount: downloadSummary.failures.length,
-    lastRunAt: new Date().toISOString(),
-    lastCheckedAt: new Date().toISOString(),
-  };
-  saveState(state);
+  await updateState((state) => {
+    const previous = state.pulledCases[canonicalCase] || state.pulledCases[normCase] || {};
+    state.pulledCases[canonicalCase] = buildCaseStateRecord(roaData, downloadSummary, previous);
+    if (canonicalCase !== normCase) delete state.pulledCases[normCase];
+  }, options.stateFile);
 
   return {
     updated: downloadSummary.downloaded.length > 0,
     newDocs: downloadSummary.downloaded.length,
+    verifiedDocs: downloadSummary.documents.length,
     summary: downloadSummary,
   };
 }
@@ -74,10 +53,16 @@ export async function syncCase(browserClient, caseNumber, options = {}) {
  * Sync all known active cases in state.json.
  */
 export async function syncAllActiveCases(browserClient, options = {}) {
-  const state = loadState();
-  const caseNumbers = Object.keys(state.pulledCases || {});
+  const state = loadState(options.stateFile);
+  const entries = Object.entries(state.pulledCases || {});
+  const activeEntries = entries.filter(([, record]) => {
+    if (!record.caseStatus) return true;
+    return /active|open/i.test(record.caseStatus);
+  });
+  const caseNumbers = activeEntries.map(([caseNumber]) => caseNumber);
+
   console.log(`\n======================================================`);
-  console.log(`[Sync Manager] Starting daily sync of ${caseNumbers.length} tracked case(s)...`);
+  console.log(`[Sync Manager] Starting sync of ${caseNumbers.length} active or legacy-unclassified case(s)...`);
   console.log(`======================================================`);
 
   let updatedCount = 0;
@@ -89,25 +74,34 @@ export async function syncAllActiveCases(browserClient, options = {}) {
     console.log(`\n--- Syncing [${i + 1}/${caseNumbers.length}]: ${caseNo} ---`);
 
     try {
-      const res = await syncCase(browserClient, caseNo, options);
-      if (res.updated) {
+      const result = await syncCase(browserClient, caseNo, options);
+      if (result.updated) {
         updatedCount++;
-        console.log(`  ✓ Case ${caseNo} updated with ${res.newDocs} new document(s).`);
+        console.log(`  ✓ Case ${caseNo} updated with ${result.newDocs} new or repaired document(s).`);
       } else {
         upToDateCount++;
       }
-    } catch (err) {
+    } catch (error) {
       failedCount++;
-      console.error(`  ✗ Error syncing ${caseNo}: ${err.message}`);
+      console.error(`  ✗ Error syncing ${caseNo}: ${error.message}`);
+      if (error.message.includes('[WAF BLOCKED]')) throw error;
     }
 
     if (i < caseNumbers.length - 1) {
       const jitter = await sleepJitter();
-      console.log(`[WAF Safe] Pausing ${Math.round(jitter / 1000)}s before next case...`);
+      console.log(`[Rate Limit] Pausing ${Math.round(jitter / 1000)}s before next case...`);
     }
   }
 
+  const summary = { total: caseNumbers.length, updatedCount, upToDateCount, failedCount };
   console.log(`\n======================================================`);
   console.log(`[Sync Manager] Sync finished: ${updatedCount} updated, ${upToDateCount} unchanged, ${failedCount} errors.`);
   console.log(`======================================================`);
+
+  if (failedCount > 0) {
+    const error = new Error(`${failedCount} case sync(s) failed; the run is incomplete`);
+    error.summary = summary;
+    throw error;
+  }
+  return summary;
 }

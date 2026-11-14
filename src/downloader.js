@@ -30,101 +30,145 @@ export function verifyPdfBuffer(buffer) {
     };
   }
 
+  const tail = buffer.subarray(Math.max(0, buffer.length - 4096)).toString('latin1');
+  if (!tail.includes('%%EOF')) {
+    return { valid: false, reason: 'Missing PDF end-of-file marker (%%EOF)' };
+  }
+
   return { valid: true };
 }
 
+function sanitizeFilenamePart(value, fallback = 'document', maxLength = 120) {
+  const cleaned = String(value || '')
+    .normalize('NFKC')
+    .replace(/[^a-zA-Z0-9_.-]+/g, '_')
+    .replace(/^[_ .-]+|[_ .-]+$/g, '')
+    .slice(0, maxLength);
+  return cleaned || fallback;
+}
+
+function writeFileAtomic(filePath, contents) {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, contents);
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  }
+}
+
+export function createDocumentKey(docEvent) {
+  const identity = [
+    docEvent.indexText || '',
+    docEvent.date || '',
+    docEvent.description || '',
+    docEvent.document?.pages || '',
+    docEvent.index || '',
+  ].join('\u001f');
+  return crypto.createHash('sha256').update(identity).digest('hex');
+}
+
+function loadExistingManifest(targetDir) {
+  const indexPath = path.join(targetDir, 'docket-export-index.json');
+  if (!fs.existsSync(indexPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (error) {
+    throw new Error(`Existing manifest is invalid: ${indexPath}: ${error.message}`);
+  }
+}
+
+function verifyExistingDocument(filePath, expectedSha256) {
+  if (!fs.existsSync(filePath)) return null;
+  const buffer = fs.readFileSync(filePath);
+  const verification = verifyPdfBuffer(buffer);
+  if (!verification.valid) return null;
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  if (expectedSha256 && sha256 !== expectedSha256) return null;
+  return { sizeBytes: buffer.length, sha256 };
+}
+
+function filenameFromDisposition(disposition, fallback) {
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?/i);
+  if (!match?.[1]) return fallback;
+  try {
+    return decodeURIComponent(match[1].trim());
+  } catch {
+    return match[1].trim();
+  }
+}
+
 /**
- * Download a single document using authenticated in-page fetch.
+ * Download a single document using the browser context's authenticated request
+ * client. The PDF bytes stay outside the page/Node serialization bridge.
  */
 export async function downloadDocument(page, docEvent, caseNumber) {
-  const formIdx = docEvent.document.formIndex;
-  console.log(`  [Downloader] Fetching doc #${docEvent.index}: "${docEvent.description}" (formIdx: ${formIdx})...`);
+  const documentKey = createDocumentKey(docEvent);
+  console.log(`  [Downloader] Fetching doc #${docEvent.index}: \"${docEvent.description}\"...`);
 
-  // Evaluate in-page fetch with form elements
-  const fetchResult = await page.evaluate(async (idx) => {
-    try {
-      const forms = Array.from(document.querySelectorAll('#mpa-roa-case-events-content form'));
-      const form = forms[idx] || forms.find((f) => {
-        const inp = f.querySelector('input[name="DocumentDownloadToken"]');
-        return inp && inp.value;
-      });
+  const formData = await page.evaluate(({ downloadToken, formIndex }) => {
+    const forms = Array.from(document.querySelectorAll('#mpa-roa-case-events-content form[action*=\"DownloadDocument\"]'));
+    const form = forms.find((candidate) => {
+      const input = candidate.querySelector('input[name=\"DocumentDownloadToken\"]');
+      return downloadToken && input?.value === downloadToken;
+    }) || forms[formIndex];
 
-      if (!form) {
-        return { success: false, error: 'Form element not found in DOM' };
-      }
+    if (!form) return null;
+    return {
+      action: form.action,
+      fields: Array.from(new FormData(form).entries()).map(([name, value]) => [name, String(value)]),
+    };
+  }, {
+    downloadToken: docEvent.document.downloadToken,
+    formIndex: docEvent.document.formIndex,
+  });
 
-      const formData = new FormData(form);
-      const resp = await fetch(form.action, {
-        method: 'POST',
-        body: formData,
-        headers: {
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-      });
+  if (!formData?.action) {
+    throw new Error('Document download form was not found in the current docket');
+  }
 
-      if (!resp.ok) {
-        return {
-          success: false,
-          status: resp.status,
-          statusText: resp.statusText,
-          error: `HTTP ${resp.status} ${resp.statusText}`,
-        };
-      }
+  const body = new URLSearchParams();
+  for (const [name, value] of formData.fields) body.append(name, value);
 
-      const disposition = resp.headers.get('content-disposition') || '';
-      const contentType = resp.headers.get('content-type') || '';
-      const arrayBuf = await resp.arrayBuffer();
+  const response = await page.request.post(formData.action, {
+    data: body.toString(),
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-requested-with': 'XMLHttpRequest',
+    },
+    timeout: CONFIG.delays.downloadTimeoutMs,
+  });
 
-      // Convert array buffer to base64 for safe bridge transport
-      const bytes = new Uint8Array(arrayBuf);
-      let binary = '';
-      const len = bytes.byteLength;
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
-
-      return {
-        success: true,
-        status: resp.status,
-        contentType,
-        disposition,
-        sizeBytes: len,
-        base64,
-      };
-    } catch (err) {
-      return { success: false, error: err.message };
+  try {
+    if (!response.ok()) {
+      throw new Error(`HTTP ${response.status()} ${response.statusText()}`);
     }
-  }, formIdx);
 
-  if (!fetchResult.success) {
-    throw new Error(`In-page fetch failed: ${fetchResult.error || 'Unknown error'}`);
+    const buffer = await response.body();
+    const verification = verifyPdfBuffer(buffer);
+    if (!verification.valid) {
+      throw new Error(`Downloaded file failed PDF verification: ${verification.reason}`);
+    }
+
+    const headers = response.headers();
+    const fallback = sanitizeFilenamePart(docEvent.description, 'document');
+    const sourceFilename = filenameFromDisposition(headers['content-disposition'] || '', fallback);
+    const sourceStem = sanitizeFilenamePart(path.basename(sourceFilename).replace(/\.pdf$/i, ''), fallback);
+    const safeCase = sanitizeFilenamePart(caseNumber, 'UNKNOWN_CASE', 40);
+    const filename = `MCRO_${safeCase}_${documentKey.slice(0, 16)}_${sourceStem}.pdf`;
+    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+
+    return {
+      documentKey,
+      filename,
+      buffer,
+      sizeBytes: buffer.length,
+      sha256,
+    };
+  } finally {
+    await response.dispose();
   }
-
-  const buffer = Buffer.from(fetchResult.base64, 'base64');
-  const verify = verifyPdfBuffer(buffer);
-  if (!verify.valid) {
-    throw new Error(`Downloaded file failed PDF verification: ${verify.reason}`);
-  }
-
-  // Extract filename from disposition or synthesize clean filename
-  let filename = '';
-  const match = fetchResult.disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-  if (match && match[1]) {
-    filename = decodeURIComponent(match[1].trim());
-  } else {
-    const cleanDesc = (docEvent.description || 'document').replace(/[^a-zA-Z0-9_\-\.]+/g, '_');
-    filename = `MCRO_${caseNumber}_${docEvent.index}_${cleanDesc}.pdf`;
-  }
-
-  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-
-  return {
-    filename,
-    buffer,
-    sizeBytes: buffer.length,
-    sha256,
-  };
 }
 
 /**
@@ -133,21 +177,31 @@ export async function downloadDocument(page, docEvent, caseNumber) {
 export async function downloadAllCaseDocuments(page, roaData, options = {}) {
   const caseNumber = roaData.caseInfo.caseNumber || 'UNKNOWN_CASE';
   const targetDir = options.outputDir || path.join(CONFIG.outputDir, caseNumber);
+  fs.mkdirSync(targetDir, { recursive: true });
 
-  if (!fs.existsSync(targetDir)) {
-    fs.mkdirSync(targetDir, { recursive: true });
-  }
+  const priorManifest = loadExistingManifest(targetDir);
+  const priorDocuments = new Map(
+    (priorManifest?.documents || [])
+      .filter((document) => document.documentKey)
+      .map((document) => [document.documentKey, document])
+  );
+  const docEvents = roaData.events.filter((event) => event.hasDocument);
 
-  const docEvents = roaData.events.filter((e) => e.hasDocument);
   console.log(`[Downloader] Starting download of ${docEvents.length} document(s) for case ${caseNumber}...`);
   console.log(`[Downloader] Target directory: ${targetDir}`);
 
   const results = {
+    schemaVersion: '2.0.0',
     caseNumber,
     caseTitle: roaData.caseInfo.caseTitle,
     caseType: roaData.caseInfo.caseType,
+    caseStatus: roaData.caseInfo.caseStatus,
     dateFiled: roaData.caseInfo.dateFiled,
+    caseLocation: roaData.caseInfo.caseLocation,
+    judicialOfficer: roaData.caseInfo.judicialOfficer,
+    parties: roaData.parties || [],
     totalDocuments: docEvents.length,
+    documents: [],
     downloaded: [],
     skipped: [],
     failures: [],
@@ -156,56 +210,57 @@ export async function downloadAllCaseDocuments(page, roaData, options = {}) {
 
   for (let i = 0; i < docEvents.length; i++) {
     const docEvent = docEvents[i];
+    const documentKey = createDocumentKey(docEvent);
+    const previous = priorDocuments.get(documentKey);
     console.log(`\n--- Document [${i + 1}/${docEvents.length}]: ${docEvent.description} ---`);
 
-    // Determine target filename pattern to check if already downloaded
-    const cleanDesc = (docEvent.description || 'document').replace(/[^a-zA-Z0-9_\-\.]+/g, '_');
-    const existingFiles = fs.readdirSync(targetDir);
-    const matchedExisting = existingFiles.find(
-      (f) => f.includes(caseNumber) && f.includes(cleanDesc) && f.endsWith('.pdf')
-    );
-
-    if (matchedExisting && !options.force) {
-      const fullPath = path.join(targetDir, matchedExisting);
-      const stats = fs.statSync(fullPath);
-      if (stats.size >= CONFIG.pdf.minBytes) {
-        console.log(`  [Skip] Already exists and verified: ${matchedExisting} (${stats.size} bytes)`);
-        results.skipped.push({
+    if (previous?.filename && !options.force) {
+      const existingPath = path.join(targetDir, path.basename(previous.filename));
+      const verified = verifyExistingDocument(existingPath, previous.sha256);
+      if (verified) {
+        const record = {
+          ...previous,
           index: docEvent.index,
+          indexText: docEvent.indexText,
+          date: docEvent.date,
           description: docEvent.description,
-          filename: matchedExisting,
-          sizeBytes: stats.size,
-        });
+          pages: docEvent.document.pages,
+          documentKey,
+          filename: path.basename(previous.filename),
+          savedPath: existingPath,
+          ...verified,
+        };
+        console.log(`  [Skip] Verified existing document: ${record.filename} (${record.sizeBytes} bytes)`);
+        results.documents.push(record);
+        results.skipped.push(record);
         continue;
       }
+      console.warn(`  [Repair] Existing manifest entry is missing, corrupt, or hash-mismatched; re-downloading.`);
     }
 
-    // Download with retry
     let downloadedDoc = null;
     let lastError = null;
-
     for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
       try {
         downloadedDoc = await downloadDocument(page, docEvent, caseNumber);
-        break; // Success!
-      } catch (err) {
-        lastError = err;
-        console.warn(`  [Retry ${attempt}/${CONFIG.maxRetries}] Failed to download: ${err.message}`);
+        break;
+      } catch (error) {
+        lastError = error;
+        console.warn(`  [Retry ${attempt}/${CONFIG.maxRetries}] Failed to download: ${error.message}`);
         if (attempt < CONFIG.maxRetries) {
-          const backoff = 2000 * Math.pow(2, attempt);
-          console.log(`  [Retry] Backing off for ${backoff}ms...`);
-          await new Promise((r) => setTimeout(r, backoff));
+          const backoff = 2000 * (2 ** (attempt - 1));
+          await new Promise((resolve) => setTimeout(resolve, backoff));
         }
       }
     }
 
     if (downloadedDoc) {
       const filePath = path.join(targetDir, downloadedDoc.filename);
-      fs.writeFileSync(filePath, downloadedDoc.buffer);
-      console.log(`  [Saved] ${downloadedDoc.filename} (${downloadedDoc.sizeBytes} bytes, SHA-256: ${downloadedDoc.sha256.slice(0, 12)}...)`);
-
-      results.downloaded.push({
+      writeFileAtomic(filePath, downloadedDoc.buffer);
+      const record = {
+        documentKey,
         index: docEvent.index,
+        indexText: docEvent.indexText,
         date: docEvent.date,
         description: docEvent.description,
         pages: docEvent.document.pages,
@@ -213,55 +268,60 @@ export async function downloadAllCaseDocuments(page, roaData, options = {}) {
         sizeBytes: downloadedDoc.sizeBytes,
         sha256: downloadedDoc.sha256,
         savedPath: filePath,
-      });
+      };
+      results.documents.push(record);
+      results.downloaded.push(record);
+      console.log(`  [Saved] ${record.filename} (${record.sizeBytes} bytes, SHA-256: ${record.sha256.slice(0, 12)}...)`);
 
-      // Humanized jitter pause before next download to keep WAF safe
       if (i < docEvents.length - 1) {
         const jitter = await sleepJitter();
-        console.log(`  [WAF Safe] Pausing ${Math.round(jitter / 1000)}s before next document...`);
+        console.log(`  [Rate Limit] Pausing ${Math.round(jitter / 1000)}s before next document...`);
       }
     } else {
-      console.error(`  [FAILED] Document #${docEvent.index} (${docEvent.description}): ${lastError.message}`);
+      const error = lastError?.message || 'Unknown download error';
+      console.error(`  [FAILED] Document #${docEvent.index} (${docEvent.description}): ${error}`);
       results.failures.push({
+        documentKey,
         index: docEvent.index,
+        date: docEvent.date,
         description: docEvent.description,
-        error: lastError.message,
+        error,
       });
     }
   }
 
   results.finishedAt = new Date().toISOString();
-
-  // Write docket-export-index.json
   const indexPath = path.join(targetDir, 'docket-export-index.json');
-  fs.writeFileSync(indexPath, JSON.stringify(results, null, 2), 'utf-8');
+  results.indexPath = indexPath;
+  writeFileAtomic(indexPath, `${JSON.stringify(results, null, 2)}\n`);
 
-  // Write human-readable README.txt
   const readmeLines = [
-    `MCRO Case Docket Export`,
-    `==============================================`,
+    'MCRO Case Docket Export',
+    '==============================================',
     `Case Number:   ${results.caseNumber}`,
     `Case Title:    ${results.caseTitle}`,
     `Case Type:     ${results.caseType}`,
     `Date Filed:    ${results.dateFiled}`,
     `Exported At:   ${results.finishedAt}`,
-    `Total Files:   ${results.downloaded.length} downloaded, ${results.skipped.length} skipped, ${results.failures.length} failed.`,
-    `==============================================\n`,
-    `Downloaded Documents:`,
-    ...results.downloaded.map(
-      (d) => `  - [${d.date}] ${d.description} -> ${d.filename} (${d.sizeBytes} bytes, ${d.pages || 'N/A'})`
+    `Total Files:   ${results.documents.length} verified, ${results.downloaded.length} downloaded this run, ${results.failures.length} failed.`,
+    '==============================================',
+    '',
+    'Verified Documents:',
+    ...results.documents.map(
+      (document) => `  - [${document.date}] ${document.description} -> ${document.filename} (${document.sizeBytes} bytes, ${document.pages || 'N/A'})`
     ),
   ];
   if (results.failures.length > 0) {
     readmeLines.push(
-      `\nFailures:`,
-      ...results.failures.map((f) => `  - Document #${f.index} (${f.description}): ${f.error}`)
+      '',
+      'Failures:',
+      ...results.failures.map((failure) => `  - Document #${failure.index} (${failure.description}): ${failure.error}`)
     );
   }
-  fs.writeFileSync(path.join(targetDir, 'README.txt'), readmeLines.join('\n'), 'utf-8');
+  writeFileAtomic(path.join(targetDir, 'README.txt'), `${readmeLines.join('\n')}\n`);
 
-  console.log(`\n[Downloader] Complete: ${results.downloaded.length} saved, ${results.skipped.length} skipped, ${results.failures.length} failed.`);
+  console.log(`\n[Downloader] Complete: ${results.downloaded.length} saved, ${results.skipped.length} verified existing, ${results.failures.length} failed.`);
   console.log(`[Downloader] Index written to ${indexPath}`);
-
   return results;
 }
+

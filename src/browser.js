@@ -30,6 +30,10 @@ async function createExtensionClient(options) {
   }
 
   const context = connection.browser.contexts()[0];
+  if (!context) {
+    await connection.close().catch(() => {});
+    throw new Error('Playwriter connected, but no Chrome browser context is available');
+  }
   const page = await context.newPage();
 
   // Helper to safely navigate with terms check
@@ -86,15 +90,11 @@ async function createStandaloneClient(options) {
       '--disable-setuid-sandbox',
       '--disable-infobars',
       '--window-position=0,0',
-      '--ignore-certificate-errors',
-      '--ignore-certificate-errors-spki-list',
     ],
   });
 
   const context = await browser.newContext({
     storageState,
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     viewport: { width: 1440, height: 900 },
     deviceScaleFactor: 2,
     acceptDownloads: true,
@@ -114,10 +114,10 @@ async function createStandaloneClient(options) {
   }
 
   async function saveSession() {
-    const dir = path.dirname(CONFIG.sessionFile);
+    const dir = path.dirname(sessionPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    await context.storageState({ path: CONFIG.sessionFile });
-    console.log(`[Browser] Session saved to ${CONFIG.sessionFile}`);
+    await context.storageState({ path: sessionPath });
+    console.log(`[Browser] Session saved to ${sessionPath}`);
   }
 
   async function close() {

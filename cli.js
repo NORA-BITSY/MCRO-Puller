@@ -5,22 +5,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG } from './src/config.js';
 import { createBrowserClient } from './src/browser.js';
-import { searchCases, searchHearings, searchDocumentDirect } from './src/search.js';
-import { crawlCase, crawlParty, crawlAttorney, loadState } from './src/crawler.js';
+import { searchCases, searchHearings } from './src/search.js';
+import { crawlCase } from './src/crawler.js';
+import { loadState } from './src/state.js';
 import { verifyPdfBuffer } from './src/downloader.js';
 import { ProxyManager } from './src/proxy.js';
 import { WorkerQueue } from './src/queue.js';
 import { syncCase, syncAllActiveCases } from './src/sync.js';
+import { crawlStatewideActiveCases } from './src/statewide.js';
 import { preprocessPdf } from './src/ocr.js';
 import { synthesizeCaseDossier } from './src/nlp.js';
-import { COUNTIES, getAllCountyNames } from './src/counties.js';
+import { COUNTIES } from './src/counties.js';
 
 const program = new Command();
 
 program
   .name('mcro')
-  .description('Autonomous Minnesota Court Records Online (MCRO) WAF-Safe Document Engine & Crawler')
-  .version('1.1.0');
+  .description('Rate-limited Minnesota Court Records Online public-document synchronizer')
+  .version('1.2.0');
 
 // 1. SEARCH COMMAND (Covering all MCRO UI fields)
 program
@@ -120,7 +122,7 @@ program
       });
 
       const res = await crawlCase(client, caseNumber, {
-        outputDir: opts.out ? path.join(opts.out, caseNumber) : undefined,
+        outputDir: opts.out,
         force: opts.force,
       });
 
@@ -169,10 +171,28 @@ program
       process.exitCode = 1;
       return;
     }
+    if (!Number.isInteger(opts.workers) || opts.workers < 1) {
+      console.error('--workers must be a positive integer');
+      process.exitCode = 1;
+      return;
+    }
 
-    console.log(`[Bulk Download] Queuing ${caseList.length} cases across ${opts.workers} worker(s)...`);
+    const uniqueCases = [...new Set(caseList)];
+    if (uniqueCases.length === 0) {
+      console.error('No case numbers were provided');
+      process.exitCode = 1;
+      return;
+    }
+
+
+    console.log(`[Bulk Download] Queuing ${uniqueCases.length} unique cases across ${opts.workers} worker(s)...`);
 
     const proxyManager = opts.proxies ? new ProxyManager({ proxyFile: opts.proxies }) : null;
+    if (opts.proxies && proxyManager.proxies.length === 0) {
+      console.error(`No valid proxies were loaded from ${opts.proxies}`);
+      process.exitCode = 1;
+      return;
+    }
     const queue = new WorkerQueue({
       concurrency: opts.workers,
       proxyManager,
@@ -182,8 +202,9 @@ program
       force: opts.force,
     });
 
-    queue.addCases(caseList);
-    await queue.run();
+    queue.addCases(uniqueCases);
+    const summary = await queue.run();
+    if (summary.failed > 0 || summary.stopped) process.exitCode = 1;
   });
 
 // 4. SYNC COMMAND (Incremental daily updates)
@@ -214,16 +235,21 @@ program
 // 5. STATEWIDE COMMAND (County-partitioned discovery)
 program
   .command('statewide')
-  .description('Statewide partitioned crawl of active cases without hitting the 200-result cap')
+  .description('Statewide active-case crawl with date bisection and explicit cap failures')
   .option('--county <counties>', 'Specific counties (comma-separated, default: all 87 counties)')
   .option('--category <categories>', 'Specific categories: CV,CR,FAM,PR (default: all)')
   .option('--days <number>', 'Only pull cases filed within past N days (default: 1)', (v) => parseInt(v, 10), 1)
   .option('-o, --out <dir>', 'Output directory', CONFIG.outputDir)
   .option('-m, --mode <mode>', 'Browser mode: "extension" or "standalone"', 'extension')
+  .option('--headed', 'Run browser headed', false)
   .action(async (opts) => {
     let client;
     try {
-      client = await createBrowserClient({ mode: opts.mode });
+      client = await createBrowserClient({ mode: opts.mode, headed: opts.headed });
+      if (!Number.isInteger(opts.days) || opts.days < 1) {
+        throw new Error('--days must be a positive integer');
+      }
+
 
       const counties = opts.county ? opts.county.split(',').map((c) => c.trim()) : undefined;
       const categories = opts.category ? opts.category.split(',').map((c) => c.trim().toUpperCase()) : undefined;
@@ -254,9 +280,9 @@ program
   .command('daemon')
   .description('Run continuously as a 24/7 background service, syncing active cases daily')
   .option('-i, --interval <hours>', 'Sync interval in hours', (v) => parseFloat(v), 24)
-  .option('-p, --proxies <path>', 'Path to proxies list file')
-  .option('-w, --workers <count>', 'Concurrency', (v) => parseInt(v, 10), 1)
   .option('-o, --out <dir>', 'Output directory', CONFIG.outputDir)
+  .option('-m, --mode <mode>', 'Browser mode: \"extension\" or \"standalone\"', 'extension')
+  .option('--headed', 'Run browser headed', false)
   .action(async (opts) => {
     console.log(`\n======================================================`);
     console.log(`[MCRO Daemon] Starting continuous puller service`);
@@ -264,10 +290,18 @@ program
     console.log(`[MCRO Daemon] Output directory: ${opts.out}`);
     console.log(`======================================================\n`);
 
+    if (!Number.isFinite(opts.interval) || opts.interval <= 0) {
+      console.error('--interval must be a positive number of hours');
+      process.exitCode = 1;
+      return;
+    }
+
     let running = true;
+    let wakeSleeper = null;
     const shutdown = () => {
       console.log('\n[MCRO Daemon] Shutting down daemon...');
       running = false;
+      wakeSleeper?.();
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
@@ -276,10 +310,11 @@ program
       console.log(`\n[MCRO Daemon] Initiating sync run at ${new Date().toISOString()}...`);
       let client;
       try {
-        client = await createBrowserClient({ mode: 'extension' });
+        client = await createBrowserClient({ mode: opts.mode, headed: opts.headed });
         await syncAllActiveCases(client, { outputDir: opts.out });
       } catch (err) {
         console.error(`[MCRO Daemon] Sync iteration error: ${err.message}`);
+        process.exitCode = 1;
       } finally {
         if (client) await client.close().catch(() => {});
       }
@@ -287,14 +322,21 @@ program
       if (!running) break;
       const sleepMs = opts.interval * 60 * 60 * 1000;
       console.log(`[MCRO Daemon] Sleeping for ${opts.interval} hour(s) until next sync run...`);
-      await new Promise((resolve) => setTimeout(resolve, Math.min(sleepMs, 10000)));
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, sleepMs);
+        wakeSleeper = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      wakeSleeper = null;
     }
   });
 
 // 7. PROXY-TEST COMMAND
 program
   .command('proxy-test')
-  .description('Benchmark and verify a list of proxies against MCRO and Volterra WAF')
+  .description('Test configured proxy connectivity and latency against the MCRO landing page')
   .argument('<proxyFile>', 'Path to proxies list file')
   .action(async (proxyFile) => {
     console.log(`[Proxy Test] Testing proxies from ${proxyFile}...`);
@@ -336,7 +378,7 @@ program
 // 8. VERIFY COMMAND
 program
   .command('verify')
-  .description('Audit downloaded PDFs to ensure 100% genuine %PDF magic bytes and >= 1KB size')
+  .description('Audit downloaded PDFs for size, PDF header, and end-of-file markers')
   .argument('[directory]', 'Cases directory to verify', CONFIG.outputDir)
   .action(async (dir) => {
     const targetDir = path.resolve(dir);
@@ -344,6 +386,7 @@ program
 
     if (!fs.existsSync(targetDir)) {
       console.error(`Directory not found: ${targetDir}`);
+      process.exitCode = 1;
       return;
     }
 
@@ -386,49 +429,89 @@ program
   .action(async (target) => {
     const resolvedTarget = path.resolve(target);
     console.log(`[OCR Pipeline] Processing target: ${resolvedTarget}`);
+    if (!fs.existsSync(resolvedTarget)) {
+      console.error(`Target not found: ${resolvedTarget}`);
+      process.exitCode = 1;
+      return;
+    }
 
+    const targetIsDirectory = fs.statSync(resolvedTarget).isDirectory();
     const pdfFiles = [];
-    if (fs.statSync(resolvedTarget).isDirectory()) {
-      function scan(d) {
-        for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-          const full = path.join(d, entry.name);
+    const caseDirs = new Set();
+    if (targetIsDirectory) {
+      function scan(directory) {
+        if (fs.existsSync(path.join(directory, 'docket-export-index.json'))) caseDirs.add(directory);
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          const full = path.join(directory, entry.name);
           if (entry.isDirectory()) scan(full);
-          else if (entry.isFile() && entry.name.endsWith('.pdf')) pdfFiles.push(full);
+          else if (entry.isFile() && entry.name.toLowerCase().endsWith('.pdf')) pdfFiles.push(full);
         }
       }
       scan(resolvedTarget);
     } else {
       pdfFiles.push(resolvedTarget);
+      if (fs.existsSync(path.join(path.dirname(resolvedTarget), 'docket-export-index.json'))) {
+        caseDirs.add(path.dirname(resolvedTarget));
+      }
+    }
+
+    const manifestCache = new Map();
+    function metadataFor(pdfPath) {
+      const directory = path.dirname(pdfPath);
+      if (!manifestCache.has(directory)) {
+        const manifestPath = path.join(directory, 'docket-export-index.json');
+        let manifest = null;
+        if (fs.existsSync(manifestPath)) {
+          manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+        }
+        manifestCache.set(directory, manifest);
+      }
+      const manifest = manifestCache.get(directory);
+      const document = manifest?.documents?.find((item) => item.filename === path.basename(pdfPath));
+      return {
+        caseNumber: manifest?.caseNumber,
+        documentId: document?.documentKey,
+        filedDate: document?.date,
+        index: document?.index,
+      };
     }
 
     console.log(`Found ${pdfFiles.length} PDF(s) to process.`);
+    let pdfFailures = 0;
+    const failedCaseDirs = new Set();
     for (let i = 0; i < pdfFiles.length; i++) {
-      const f = pdfFiles[i];
-      console.log(`\n[${i + 1}/${pdfFiles.length}] Preprocessing: ${path.basename(f)}...`);
+      const file = pdfFiles[i];
+      console.log(`\n[${i + 1}/${pdfFiles.length}] Preprocessing: ${path.basename(file)}...`);
       try {
-        const res = preprocessPdf(f);
-        console.log(`  Case: ${res.structured.caseNumber || 'N/A'} | Title: ${res.structured.documentTitle || 'N/A'}`);
-        console.log(`  Pages: ${res.totalPages} (Vector: ${res.pages.filter(p => p.source === 'vector_text').length}, OCR: ${res.pages.filter(p => p.source === 'tesseract_ocr').length})`);
+        const result = preprocessPdf(file, metadataFor(file));
+        const vectorPages = result.pages.filter((page) => page.source.includes('vector_text')).length;
+        const ocrPages = result.pages.filter((page) => page.source.includes('tesseract_ocr')).length;
+        console.log(`  Case: ${result.dossier.filingMeta.caseNumber || 'N/A'} | Title: ${result.structured.documentTitle || 'N/A'}`);
+        console.log(`  Pages: ${result.totalPages} (Vector: ${vectorPages}, OCR: ${ocrPages}, Warnings: ${result.warnings.length})`);
       } catch (err) {
-        console.error(`  Error processing ${path.basename(f)}: ${err.message}`);
+        pdfFailures++;
+        failedCaseDirs.add(path.dirname(file));
+        console.error(`  Error processing ${path.basename(file)}: ${err.message}`);
       }
     }
-    if (fs.statSync(resolvedTarget).isDirectory()) {
-      // Check if current directory has a docket-export-index.json or subdirectories
-      if (fs.existsSync(path.join(resolvedTarget, 'docket-export-index.json'))) {
-        synthesizeCaseDossier(resolvedTarget);
-      } else {
-        for (const sub of fs.readdirSync(resolvedTarget, { withFileTypes: true })) {
-          if (sub.isDirectory()) {
-            const subPath = path.join(resolvedTarget, sub.name);
-            if (fs.existsSync(path.join(subPath, 'docket-export-index.json'))) {
-              synthesizeCaseDossier(subPath);
-            }
-          }
-        }
+
+    let synthesisFailures = 0;
+    for (const caseDir of caseDirs) {
+      if (failedCaseDirs.has(caseDir)) {
+        synthesisFailures++;
+        console.error(`  Skipping case synthesis because one or more PDFs failed: ${caseDir}`);
+        continue;
+      }
+      try {
+        synthesizeCaseDossier(caseDir);
+      } catch (error) {
+        synthesisFailures++;
+        console.error(`  Error synthesizing ${caseDir}: ${error.message}`);
       }
     }
-    console.log(`\n[OCR Pipeline] Finished processing and generated comprehensive dossiers.`);
+
+    console.log(`\n[OCR Pipeline] Finished: ${pdfFiles.length - pdfFailures} PDF(s) processed, ${pdfFailures} PDF failure(s), ${synthesisFailures} case synthesis failure(s).`);
+    if (pdfFailures > 0 || synthesisFailures > 0) process.exitCode = 1;
   });
 
 // 9. STATUS COMMAND
@@ -483,4 +566,4 @@ function printSearchResults(result) {
   });
 }
 
-program.parse();
+await program.parseAsync();

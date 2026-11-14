@@ -21,11 +21,13 @@ export async function navigateToCaseDetails(page, caseItem) {
 
   await page.waitForTimeout(1500);
   await ensureTermsAccepted(page);
+  const wafCheck = await checkWafBlock(page);
+  if (wafCheck.blocked) throw new Error(`[WAF BLOCKED] ${wafCheck.reason}`);
 
-  const isRoa = await page.evaluate(() => !!document.querySelector('#mpa-roa-case-events-content'));
+  const eventsSelector = '#mpa-roa-case-events-content';
+  const isRoa = await page.locator(eventsSelector).isVisible({ timeout: 10000 }).catch(() => false);
   if (!isRoa) {
-    // Check if collapsed or still loading
-    await page.waitForSelector('#mpa-roa-case-events-header, #mpa-roa-case-events-content', { timeout: 10000 }).catch(() => {});
+    throw new Error(`Case details did not load at ${page.url()}`);
   }
 
   return await parseRoa(page);
@@ -70,6 +72,7 @@ export async function parseRoa(page) {
     // 3. Case Events / Documents
     const eventsContent = document.querySelector('#mpa-roa-case-events-content');
     const events = [];
+    let documentFormIndex = 0;
     if (eventsContent) {
       const eventItems = eventsContent.querySelectorAll('.mpa-case-details-party-item');
       eventItems.forEach((item, idx) => {
@@ -104,9 +107,10 @@ export async function parseRoa(page) {
             requestVerificationToken,
             pages,
             formAction: form.action,
-            formIndex: idx,
+            formIndex: documentFormIndex,
             btnSelector: `#mpa-roa-case-events-content .mpa-case-details-party-item:nth-of-type(${idx + 1}) button.btn-mpa-download-document`,
           };
+          documentFormIndex++;
         }
 
         events.push({

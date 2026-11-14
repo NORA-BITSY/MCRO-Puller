@@ -1,208 +1,219 @@
 # MCRO-Puller
 
-Autonomous, WAF-safe document discovery, bulk PDF extraction, and legal NLP/NER intelligence engine for **Minnesota Court Records Online (MCRO)** (`publicaccess.courts.state.mn.us`).
+Rate-limited browser automation for searching Minnesota Court Records Online (MCRO), downloading publicly available case PDFs, maintaining local case manifests, and producing OCR/text-analysis artifacts.
 
----
+The application does **not** bypass access controls. It detects block/error pages, stops affected work, and returns a failing exit code. Operators remain responsible for MCRO terms, applicable law, privacy obligations, and an appropriate request rate.
 
-## Architecture & System Overview
+## What it does
 
-`MCRO-Puller` is built for continuous, large-scale court record synchronization across all 87 Minnesota counties. It solves the core challenges of scraping public court portals:
+- Searches case-number, citation, person, business, attorney, bar-number, filed-date, status, category, county, DOB, hearing-date, and judicial-officer fields exposed by the supported MCRO views.
+- Downloads public docket PDFs through the authenticated browser context.
+- Keeps each case in an isolated directory with a versioned manifest and SHA-256 hashes.
+- Verifies existing files before skipping them; missing, truncated, or hash-mismatched files are downloaded again.
+- Synchronizes tracked active cases and reports partial runs as failures.
+- Splits statewide county/category/date searches when MCRO returns the 200-result cap. A still-capped one-day slice fails explicitly rather than claiming complete coverage.
+- Extracts embedded PDF text, falls back to per-page Tesseract OCR, and writes deterministic filing/case dossiers and bounded LLM-ready chunks.
 
-1. **WAF & Bot Immunity (F5 Distributed Cloud / Volterra ADC & F5 BIG-IP ASM)**:
-   - **Extension Mode (Default)**: Leverages your local running Chrome profile via Playwriter / CDP. Operates with genuine human TLS profiles, active session cookies (`mcro-session`, `TS01...`, `IsAcceptedTerms`), hardware graphics acceleration, and residential/mobile network signatures. **0% CAPTCHA/WAF rejection rate.**
-   - **Standalone Mode + Proxy Pool**: For cloud resources (AWS, GCP, VPS), provides a multi-worker crawler backed by `playwright-extra` + stealth, rotating residential/mobile proxies, per-worker isolated cookie jars, and automatic circuit breakers.
-2. **Statewide Discovery without Result Truncation**:
-   - MCRO truncates any broad search to 200 cases.
-   - `MCRO-Puller`'s partitioner divides statewide searches into orthogonal slices: **County (87 counties) $\times$ Category (Civil, Criminal, Family, Probate) $\times$ Date Window**. Every active case in Minnesota is discoverable without hitting the 200-case cap.
-3. **Daily Incremental Delta Sync**:
-   - Compares docket event counts against recorded state.
-   - Skips unchanged dockets in ~2 seconds with zero document downloads.
-   - Automatically detects newly filed docket rows and only pulls the new PDFs.
-4. **Hybrid Vector & Tesseract OCR Pipeline**:
-   - Born-digital PDFs (Civil Cover Sheets, Court Notices, Word-exported pleadings) have their vector text extracted instantly.
-   - Scanned raster image filings (e.g. 400 DPI CCITT fax scans of complaints, exhibits, deeds) are rendered via `pdftoppm` and OCR'd using Apple Silicon-optimized Tesseract 5.5.
-5. **Comprehensive Legal NLP & NER Data Model**:
-   - **Document Dossier (`<doc>.dossier.json`)**: Legal anatomy (Caption, Claims/Counts, Factual Allegations, Prayer for Relief, Signatures/Bar Numbers), Named Entities (Statutes, Rules, Organizations, Parcels, Critical Dates, Monetary Damages), and structurally partitioned LLM context chunks with metadata headers.
-   - **Case Dossier (`case_dossier.json`)**: Case-level synthesis with full party/attorney roster, procedural timeline, cross-document relationship graph, financial ledger, and executive brief.
+## Requirements
 
----
+- Node.js with `pnpm`
+- Chrome plus the Playwriter extension for `extension` mode, or Playwright Chromium for `standalone` mode
+- For OCR: Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`) and Tesseract
 
-## Installation
+macOS:
 
 ```bash
-git clone <repo-url> MCRO-Puller
-cd MCRO-Puller
+brew install poppler tesseract
 pnpm install
+pnpm test
 ```
 
-Prerequisites for OCR:
-- Tesseract OCR: `brew install tesseract` (Pre-installed on macOS)
-- Poppler: `brew install poppler` (Provides `pdftotext` and `pdftoppm`)
+## Browser modes
 
----
+### Extension mode
 
-## CLI Reference
-
-### 1. Universal Search (All UI Fields)
-Search across any and all MCRO search view fields:
+Default. Connects to an existing Chrome context through Playwriter and opens a dedicated page. Chrome and the Playwriter extension must already be running.
 
 ```bash
-# Search by Case Number or Citation
-node cli.js search --case 67-CV-26-300
+node cli.js search --case 27-CV-24-1 --mode extension
+```
+
+### Standalone mode
+
+Launches an isolated Chromium context. Session state is read from and can be saved to `~/.mcro-puller/session.json` by the browser client.
+
+```bash
+node cli.js search --case 27-CV-24-1 --mode standalone --headed
+```
+
+An optional proxy list can route standalone bulk workers. Proxy routing is not a permission mechanism and must not be used to evade a block. Failed or blocked proxies are quarantined; the queue stops rather than silently falling back to the host IP when no configured proxy remains healthy.
+
+## CLI
+
+### Search
+
+```bash
+node cli.js search --case 27-CV-24-1
 node cli.js search --citation 882606190625
-
-# Search by Person Name with filters
-node cli.js search --name "Anderson" --first "John" --county "Rock" --category "CV" --status "Active"
-
-# Search by Business Name
-node cli.js search --business "Hawthorne"
-
-# Search by Attorney Name or MN Bar/License Number
-node cli.js search --attorney "Vis"
-node cli.js search --bar "0392011"
-
-# Search Hearings by Judicial Officer & Date Range
-node cli.js search --judge "Johnson, Kayla M." --hearing-from "2026-11-01" --hearing-to "2026-11-30"
+node cli.js search --name Anderson --first John --county Hennepin --category CV --status Active
+node cli.js search --business "Example Holdings LLC"
+node cli.js search --attorney Smith
+node cli.js search --bar 0392011
+node cli.js search --judge "Johnson, Kayla M." --hearing-from 2025-01-01 --hearing-to 2025-01-31 --county Hennepin
 ```
 
-### 2. Single Case Download
+Unknown counties, categories, and statuses fail instead of being silently ignored.
+
+### Download one case
+
 ```bash
-node cli.js download-case 67-CV-26-300 --out ./downloads
+node cli.js download-case 27-CV-24-1 --out ./data/cases
 ```
 
-### 3. Bulk Downloads
-Download dozens or thousands of cases from a file:
+Output goes to `./data/cases/27-CV-24-1/`.
+
+### Bulk download
 
 ```bash
-# From a text file (one case number per line)
-node cli.js bulk-download --file cases.txt --workers 3
-
-# With residential proxies for cloud runs
-node cli.js bulk-download --file cases.txt --workers 5 --proxies proxies.txt --mode standalone
+node cli.js bulk-download --file cases.txt --workers 2 --out ./data/cases
+node cli.js bulk-download --cases 27-CV-24-1,62-CV-24-2
+node cli.js bulk-download --file cases.txt --workers 2 --mode standalone --proxies proxies.txt
 ```
 
-### 4. Incremental Daily Sync
-Keep previously downloaded cases continuously updated:
+Text files use one case number per line; blank lines and lines beginning with `#` are ignored. JSON input must be an array. Duplicate case numbers are removed before queueing.
+
+### Synchronize tracked cases
 
 ```bash
-# Sync all active cases in state.json (only downloads newly filed documents)
-node cli.js sync
-
-# Sync a single specific case
-node cli.js sync --case 67-CV-26-300
+node cli.js sync --out ./data/cases
+node cli.js sync --case 27-CV-24-1 --out ./data/cases
 ```
 
-### 5. Statewide Continuous Discovery
-Partition across Minnesota's 87 counties to pull all active cases:
+Sync revisits the docket and verifies every manifest-listed file. It does not rely only on the previous document count, so same-count docket changes and local corruption are not silently treated as current. Records marked active/open, plus legacy records without a status, are included in full syncs.
+
+### Statewide discovery
 
 ```bash
-# Pull active cases filed in the past 24 hours across all counties
-node cli.js statewide --days 1
-
-# Pull active civil cases in specific counties
-node cli.js statewide --county "Hennepin,Ramsey,Rock" --category "CV" --days 7
+node cli.js statewide --days 1 --out ./data/cases
+node cli.js statewide --county Hennepin,Ramsey --category CV,CR --days 7 --out ./data/cases
 ```
 
-### 6. Continuous 24/7 Daemon Service
-Run in the background to automatically sync active cases every 24 hours:
+The crawler partitions by county and category, then bisects capped date ranges. If a single county/category/day still reaches the cap, the command exits nonzero and identifies the incomplete partition. This is an integrity guard, not a guarantee that MCRO exposes every case or document.
+
+### Continuous sync
 
 ```bash
-node cli.js daemon --interval 24 --out ./downloads
+node cli.js daemon --interval 24 --mode extension --out ./data/cases
 ```
 
-### 7. Hybrid OCR & NLP Preprocessing Pipeline
-Extract full text, parse legal entities, and build LLM chunks:
+The daemon waits the full configured interval. `SIGINT` and `SIGTERM` interrupt the wait and close the browser. Use a process supervisor for restart policy and logs.
+
+### Verify PDFs
 
 ```bash
-# Process all PDFs in a case directory
-node cli.js ocr ./downloads/67-CV-26-300
+node cli.js verify ./data/cases
 ```
 
-Generates:
-- `*.pdf`: Original verified court document (%PDF magic bytes guaranteed).
-- `*.txt`: Full clean text (hybrid vector + Tesseract OCR).
-- `*.dossier.json`: Filing-level anatomy, NER entities, and pre-computed LLM chunks.
-- `case_dossier.json`: Master synthesized case brief and procedural timeline.
+Checks minimum size, `%PDF` header, and a trailing `%%EOF` marker. Download manifests additionally enforce the previously recorded SHA-256 hash.
 
-### 8. Verification & Auditing
+### OCR and deterministic preprocessing
+
 ```bash
-# Audit downloaded files to guarantee 0% corrupted stubs
-node cli.js verify ./downloads
+node cli.js ocr ./data/cases/27-CV-24-1
+node cli.js ocr ./data/cases
+```
 
-# Show summary of all tracked cases
+For every PDF, the pipeline writes:
+
+- `<document>.txt` — extracted text with page separators
+- `<document>.dossier.json` — provenance, page extraction sources, warnings, deterministic document classification/entities/anatomy, and bounded chunks
+- `case_dossier.json` — case metadata, parties, filing index, procedural timeline, and merged deterministic headings/entities
+
+The dossier summary fields are extractive previews, not LLM-generated legal conclusions. Regex-derived entities can contain false positives or omissions and must retain links to the source PDF/text.
+
+### Other commands
+
+```bash
 node cli.js status
-
-# List all 87 Minnesota counties and codes
 node cli.js counties
+node cli.js proxy-test proxies.txt
 ```
 
----
+## Durable output model
 
-## Data Model Structure
+Default locations:
 
-### Document Dossier (`<doc>.dossier.json`)
-```json
-{
-  "schemaVersion": "1.0.0",
-  "filingMeta": {
-    "caseNumber": "67-CV-26-300",
-    "filename": "MCRO_67-CV-26-300_Complaint-Civil_2026-11-03.pdf",
-    "totalPages": 16,
-    "documentType": "COMPLAINT"
-  },
-  "documentAnatomy": {
-    "caption": {
-      "caseNumber": "67-CV-26-300",
-      "county": "Rock",
-      "judicialDistrict": "FIFTH"
-    },
-    "causesOfAction": [
-      {
-        "countNumber": "COUNT I",
-        "title": "Quiet Title / Adverse Possession",
-        "allegationSnippet": "..."
-      }
-    ],
-    "prayerForRelief": ["..."],
-    "signatures": [
-      {
-        "signer": "Paul Alan Vis",
-        "firm": "Vis & Linder Law Offices",
-        "barNumber": "0392011"
-      }
-    ]
-  },
-  "nerAnalysis": {
-    "statutesAndRules": ["Minn. Stat. § 541.02"],
-    "organizations": ["Anderson Family Revocable Living Trust", "Illinois Central Gulf Railroad Company"],
-    "locationsAndParcels": ["Section 30, Township 101 North, Range 46 West"],
-    "criticalDates": ["September 1, 2015", "December 27, 2012"],
-    "monetaryAmounts": ["$320.00"]
-  },
-  "llmContext": {
-    "executiveSummary": "[COMPLAINT] Action to determine adverse claims...",
-    "chunks": [
-      {
-        "chunkId": "67-CV-26-300-chunk-1",
-        "index": 1,
-        "text": "[DOCUMENT: COMPLAINT | CASE: 67-CV-26-300]\n\n...",
-        "tokenEstimate": 457,
-        "metadata": { "caseNumber": "67-CV-26-300", "documentType": "COMPLAINT" }
-      }
-    ]
-  }
-}
+- Cases: `~/mncourt-data/cases/<case-number>/`
+- State: `~/mncourt-data/state.json`
+- Standalone session: `~/.mcro-puller/session.json`
+
+Override cases and state independently:
+
+```bash
+export MCRO_OUTPUT_DIR=/persistent/mcro/cases
+export MCRO_STATE_FILE=/persistent/mcro/state.json
 ```
 
----
+Per-case layout:
 
-## Production Cloud Deployment (GCP / AWS / Docker)
+```text
+27-CV-24-1/
+├── docket-export-index.json
+├── README.txt
+├── MCRO_27-CV-24-1_<document-key>_<source-name>.pdf
+├── MCRO_...txt
+├── MCRO_...dossier.json
+└── case_dossier.json
+```
 
-When running on cloud datacenter IPs:
-1. Supply a list of residential or mobile proxies via `proxies.txt` (`http://user:pass@host:port`).
-2. Run `node cli.js proxy-test proxies.txt` to verify latency and Volterra WAF pass status.
-3. Start workers using standalone mode:
-   ```bash
-   node cli.js bulk-download --file cases.txt --workers 5 --proxies proxies.txt --mode standalone
-   ```
-4. Each worker automatically instantiates its own isolated browser context and cookie jar to avoid session-IP mismatch flags on F5 BIG-IP.
+`docket-export-index.json` is the authoritative downloaded-document inventory. Document keys distinguish repeated docket descriptions. Writes use temporary files plus atomic rename. `state.json` updates use both an in-process queue and an inter-process lock, and corrupt JSON fails closed instead of being replaced with an empty state.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `MCRO_OUTPUT_DIR` | `~/mncourt-data/cases` | Case directory root |
+| `MCRO_STATE_FILE` | `~/mncourt-data/state.json` | Durable tracked-case state |
+| `MCRO_MIN_DELAY_MS` | `8000` | Minimum cooperative request delay |
+| `MCRO_MAX_DELAY_MS` | `20000` | Maximum cooperative request delay |
+| `MCRO_PAGE_TIMEOUT_MS` | `30000` | Page navigation timeout |
+| `MCRO_SEARCH_TIMEOUT_MS` | `45000` | Search timeout |
+| `MCRO_DOWNLOAD_TIMEOUT_MS` | `30000` | PDF request timeout |
+| `MCRO_MAX_RETRIES` | `3` | Per-document retry count |
+| `MCRO_PROXIES` | unset | Optional comma/newline-separated proxy routes |
+
+Invalid numeric values fail at startup.
+
+## Failure semantics
+
+Commands exit nonzero for material incompleteness, including:
+
+- block/error pages or an unrecognized search result surface;
+- a capped statewide slice that cannot be split further;
+- any failed bulk worker, statewide case/partition, or full-sync case;
+- corrupt state or manifest JSON;
+- invalid/missing PDFs during verification;
+- OCR or case-dossier failures.
+
+Partial downloads remain on disk with their failure details in the case manifest. A later run verifies and resumes them.
+
+## Cloud operation
+
+Use persistent storage for both `MCRO_OUTPUT_DIR` and `MCRO_STATE_FILE`. Run one scheduler/daemon per logical workload, preserve browser/session affinity, retain logs, and alert on nonzero exits. Start with one worker and raise concurrency only when observed portal behavior and applicable terms permit it. A WAF/rate-limit response is a stop/backoff signal, not a reason to increase concurrency or rotate identities.
+
+## Tests
+
+```bash
+pnpm test
+pnpm run check
+```
+
+The suite covers concurrent state writers, atomic/provenance behavior, duplicate docket descriptions, PDF truncation, resumable manifests, capped partition bisection, search-page failure handling, OCR provenance, and NLP chunk boundaries.
+
+## Known limits
+
+- MCRO is an external UI, not a stable API. Selector or workflow changes require maintenance.
+- Public availability, sealed/restricted documents, delayed indexing, and portal outages are outside this application's control.
+- Search result cards are parsed from rendered text; changed labels can break extraction.
+- A one-day partition can still exceed MCRO's result cap; the run fails rather than guessing.
+- Deterministic NLP is preprocessing only. Human review or a separately governed model pipeline is required for legal interpretation.

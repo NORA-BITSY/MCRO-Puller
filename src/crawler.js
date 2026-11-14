@@ -1,37 +1,23 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG } from './config.js';
 import { searchByCaseNumber, searchByPartyName, searchByAttorney } from './search.js';
 import { navigateToCaseDetails } from './roa.js';
 import { downloadAllCaseDocuments } from './downloader.js';
-import { sleepJitter, normalizeCaseNumber } from './waf.js';
+import { buildCaseStateRecord, loadState, updateState } from './state.js';
+import { caseNumbersEqual, sleepJitter, normalizeCaseNumber } from './waf.js';
 
-/**
- * Load or initialize global state.json tracking all pulled cases.
- */
-export function loadState(filePath = CONFIG.stateFile) {
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-    }
-  } catch (e) {
-    // start fresh
-  }
-  return {
-    version: '1.0.0',
-    updatedAt: new Date().toISOString(),
-    pulledCases: {},
-  };
+
+export function resolveCaseOutputDir(caseNumber, options = {}) {
+  if (options.caseOutputDir) return options.caseOutputDir;
+  const root = options.outputDir || CONFIG.outputDir;
+  return path.join(root, normalizeCaseNumber(caseNumber));
 }
 
-/**
- * Save global state.json atomically.
- */
-export function saveState(state, filePath = CONFIG.stateFile) {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  state.updatedAt = new Date().toISOString();
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2), 'utf-8');
+async function recordCaseResult(caseNumber, roaData, downloadSummary, stateFile) {
+  await updateState((state) => {
+    const previous = state.pulledCases[caseNumber] || {};
+    state.pulledCases[caseNumber] = buildCaseStateRecord(roaData, downloadSummary, previous);
+  }, stateFile);
 }
 
 /**
@@ -51,29 +37,23 @@ export async function crawlCase(browserClient, caseNumber, options = {}) {
     return { success: false, reason: 'Case not found' };
   }
 
-  const caseItem = searchResult.cases[0];
+  const caseItem = searchResult.cases.find((item) => caseNumbersEqual(item.caseNumber, normCase));
+  if (!caseItem) {
+    return { success: false, reason: `No exact case-number match for ${normCase}` };
+  }
   const roaData = await navigateToCaseDetails(page, caseItem);
+  const canonicalCase = roaData.caseInfo.caseNumber || caseItem.caseNumber;
 
-  const downloadSummary = await downloadAllCaseDocuments(page, roaData, options);
+  const downloadSummary = await downloadAllCaseDocuments(page, roaData, {
+    ...options,
+    outputDir: resolveCaseOutputDir(canonicalCase, options),
+  });
 
-  // Update state
-  const state = loadState();
-  state.pulledCases[normCase] = {
-    status: downloadSummary.failures.length === 0 ? 'complete' : 'partial',
-    caseTitle: roaData.caseInfo.caseTitle,
-    caseType: roaData.caseInfo.caseType,
-    dateFiled: roaData.caseInfo.dateFiled,
-    totalDocuments: downloadSummary.totalDocuments,
-    downloadedCount: downloadSummary.downloaded.length,
-    skippedCount: downloadSummary.skipped.length,
-    failureCount: downloadSummary.failures.length,
-    lastRunAt: new Date().toISOString(),
-  };
-  saveState(state);
+  await recordCaseResult(canonicalCase, roaData, downloadSummary, options.stateFile);
 
   return {
     success: true,
-    caseNumber: normCase,
+    caseNumber: canonicalCase,
     summary: downloadSummary,
   };
 }
@@ -93,7 +73,7 @@ export async function crawlParty(browserClient, partyOptions, options = {}) {
   console.log(`[Crawler] Found ${cases.length} cases; processing ${targetCases.length} (limit: ${limit})...`);
 
   const crawlResults = [];
-  const state = loadState();
+  const state = loadState(options.stateFile);
 
   for (let i = 0; i < targetCases.length; i++) {
     const c = targetCases[i];
@@ -111,20 +91,11 @@ export async function crawlParty(browserClient, partyOptions, options = {}) {
     try {
       // Re-enter search or direct navigate to ROA
       const roaData = await navigateToCaseDetails(page, c);
-      const summary = await downloadAllCaseDocuments(page, roaData, options);
-
-      state.pulledCases[c.caseNumber] = {
-        status: summary.failures.length === 0 ? 'complete' : 'partial',
-        caseTitle: roaData.caseInfo.caseTitle,
-        caseType: roaData.caseInfo.caseType,
-        dateFiled: roaData.caseInfo.dateFiled,
-        totalDocuments: summary.totalDocuments,
-        downloadedCount: summary.downloaded.length,
-        skippedCount: summary.skipped.length,
-        failureCount: summary.failures.length,
-        lastRunAt: new Date().toISOString(),
-      };
-      saveState(state);
+      const summary = await downloadAllCaseDocuments(page, roaData, {
+        ...options,
+        outputDir: resolveCaseOutputDir(c.caseNumber, options),
+      });
+      await recordCaseResult(c.caseNumber, roaData, summary, options.stateFile);
 
       crawlResults.push({ caseNumber: c.caseNumber, summary });
     } catch (err) {
@@ -135,7 +106,7 @@ export async function crawlParty(browserClient, partyOptions, options = {}) {
     // Humanized jitter pause before returning to search for the next case
     if (i < targetCases.length - 1) {
       const delay = await sleepJitter();
-      console.log(`[WAF Safe] Pausing ${Math.round(delay / 1000)}s between cases...`);
+      console.log(`[Rate Limit] Pausing ${Math.round(delay / 1000)}s between cases...`);
     }
   }
 
@@ -157,7 +128,7 @@ export async function crawlAttorney(browserClient, attorneyOptions, options = {}
   console.log(`[Crawler] Found ${cases.length} cases; processing ${targetCases.length}...`);
 
   const crawlResults = [];
-  const state = loadState();
+  const state = loadState(options.stateFile);
 
   for (let i = 0; i < targetCases.length; i++) {
     const c = targetCases[i];
@@ -171,20 +142,11 @@ export async function crawlAttorney(browserClient, attorneyOptions, options = {}
 
     try {
       const roaData = await navigateToCaseDetails(page, c);
-      const summary = await downloadAllCaseDocuments(page, roaData, options);
-
-      state.pulledCases[c.caseNumber] = {
-        status: summary.failures.length === 0 ? 'complete' : 'partial',
-        caseTitle: roaData.caseInfo.caseTitle,
-        caseType: roaData.caseInfo.caseType,
-        dateFiled: roaData.caseInfo.dateFiled,
-        totalDocuments: summary.totalDocuments,
-        downloadedCount: summary.downloaded.length,
-        skippedCount: summary.skipped.length,
-        failureCount: summary.failures.length,
-        lastRunAt: new Date().toISOString(),
-      };
-      saveState(state);
+      const summary = await downloadAllCaseDocuments(page, roaData, {
+        ...options,
+        outputDir: resolveCaseOutputDir(c.caseNumber, options),
+      });
+      await recordCaseResult(c.caseNumber, roaData, summary, options.stateFile);
 
       crawlResults.push({ caseNumber: c.caseNumber, summary });
     } catch (err) {
@@ -194,7 +156,7 @@ export async function crawlAttorney(browserClient, attorneyOptions, options = {}
 
     if (i < targetCases.length - 1) {
       const delay = await sleepJitter();
-      console.log(`[WAF Safe] Pausing ${Math.round(delay / 1000)}s between cases...`);
+      console.log(`[Rate Limit] Pausing ${Math.round(delay / 1000)}s between cases...`);
     }
   }
 

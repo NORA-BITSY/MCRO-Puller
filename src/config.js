@@ -1,5 +1,15 @@
 import path from 'node:path';
 import os from 'node:os';
+function envInteger(name, fallback, minimum = 0) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${name} must be an integer >= ${minimum}; received \"${raw}\"`);
+  }
+  return value;
+}
+
 
 export const CONFIG = {
   urls: {
@@ -15,13 +25,13 @@ export const CONFIG = {
   stateFile: process.env.MCRO_STATE_FILE || path.join(os.homedir(), 'mncourt-data', 'state.json'),
   sessionFile: path.join(os.homedir(), '.mcro-puller', 'session.json'),
   
-  // Rate limiting / WAF avoidance
+  // Cooperative request pacing
   delays: {
-    minDelayMs: parseInt(process.env.MCRO_MIN_DELAY_MS || '8000', 10),
-    maxDelayMs: parseInt(process.env.MCRO_MAX_DELAY_MS || '20000', 10),
-    pageLoadTimeoutMs: 30000,
-    searchTimeoutMs: 45000,
-    downloadTimeoutMs: 30000,
+    minDelayMs: envInteger('MCRO_MIN_DELAY_MS', 8000, 0),
+    maxDelayMs: envInteger('MCRO_MAX_DELAY_MS', 20000, 0),
+    pageLoadTimeoutMs: envInteger('MCRO_PAGE_TIMEOUT_MS', 30000, 1000),
+    searchTimeoutMs: envInteger('MCRO_SEARCH_TIMEOUT_MS', 45000, 1000),
+    downloadTimeoutMs: envInteger('MCRO_DOWNLOAD_TIMEOUT_MS', 30000, 1000),
   },
   
   // PDF Verification rules
@@ -31,5 +41,5 @@ export const CONFIG = {
   },
   
   // Max retries per document
-  maxRetries: 3,
+  maxRetries: envInteger('MCRO_MAX_RETRIES', 3, 1),
 };

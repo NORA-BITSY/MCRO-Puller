@@ -1,6 +1,7 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import { processFilingToDossier } from './nlp.js';
 
@@ -15,6 +16,20 @@ const PDFTOTEXT_PATH = fs.existsSync('/opt/homebrew/bin/pdftotext')
 const PDFTOPPM_PATH = fs.existsSync('/opt/homebrew/bin/pdftoppm')
   ? '/opt/homebrew/bin/pdftoppm'
   : 'pdftoppm';
+const PDFINFO_PATH = fs.existsSync('/opt/homebrew/bin/pdfinfo')
+  ? '/opt/homebrew/bin/pdfinfo'
+  : 'pdfinfo';
+function writeFileAtomic(filePath, contents) {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, contents);
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  }
+}
+
+
 
 /**
  * Check if a PDF page has sufficient embedded digital text.
@@ -31,6 +46,19 @@ export function extractEmbeddedText(pdfPath) {
     return [];
   }
 }
+export function getPdfPageCount(pdfPath) {
+  try {
+    const output = execFileSync(PDFINFO_PATH, [pdfPath], {
+      encoding: 'utf-8',
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    const match = output.match(/^Pages:\s+(\d+)$/mi);
+    return match ? Number.parseInt(match[1], 10) : 0;
+  } catch (error) {
+    throw new Error(`Unable to determine PDF page count for ${pdfPath}: ${error.message}`);
+  }
+}
+
 
 /**
  * Perform OCR on a single scanned page image using Tesseract.
@@ -80,50 +108,58 @@ export function renderPageImages(pdfPath, firstPage, lastPage, dpi = 200) {
 export function extractPdfTextHybrid(pdfPath, options = {}) {
   const minWordsPerPage = options.minWordsPerPage || 35;
   const embeddedPages = extractEmbeddedText(pdfPath);
-  const totalPages = embeddedPages.length || 1;
-  const finalPages = [];
+  const reportedPages = getPdfPageCount(pdfPath);
+  const totalPages = Math.max(reportedPages, embeddedPages.length);
+  if (totalPages < 1) throw new Error(`PDF has no readable pages: ${pdfPath}`);
 
+  const finalPages = [];
+  const warnings = [];
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
     const pageText = embeddedPages[pageNum - 1] || '';
     const wordCount = pageText.split(/\s+/).filter(Boolean).length;
 
     if (wordCount >= minWordsPerPage) {
-      // Born-digital vector text
       finalPages.push({
         pageNum,
         text: pageText,
         source: 'vector_text',
         wordCount,
       });
-    } else {
-      // Scanned image: run Tesseract OCR
-      const images = renderPageImages(pdfPath, pageNum, pageNum, options.dpi || 200);
-      if (images.length > 0) {
-        const ocrText = ocrImage(images[0]);
-        try { fs.unlinkSync(images[0]); } catch (e) {}
-        finalPages.push({
-          pageNum,
-          text: ocrText,
-          source: 'tesseract_ocr',
-          wordCount: ocrText.split(/\s+/).filter(Boolean).length,
-        });
-      } else {
-        finalPages.push({
-          pageNum,
-          text: pageText,
-          source: 'vector_text_sparse',
-          wordCount,
-        });
+      continue;
+    }
+
+    const images = renderPageImages(pdfPath, pageNum, pageNum, options.dpi || 200);
+    let ocrText = '';
+    try {
+      if (images.length > 0) ocrText = ocrImage(images[0]);
+    } finally {
+      for (const image of images) {
+        try { fs.unlinkSync(image); } catch {}
       }
     }
+
+    const combinedText = [pageText.trim(), ocrText.trim()].filter(Boolean).join('\n\n');
+    const combinedWordCount = combinedText.split(/\s+/).filter(Boolean).length;
+    const source = ocrText
+      ? (pageText.trim() ? 'vector_text+tesseract_ocr' : 'tesseract_ocr')
+      : (pageText.trim() ? 'vector_text_sparse' : 'extraction_failed');
+    if (!combinedText) warnings.push(`Page ${pageNum} produced no vector text or OCR text`);
+
+    finalPages.push({
+      pageNum,
+      text: combinedText,
+      source,
+      wordCount: combinedWordCount,
+    });
   }
 
-  const fullText = finalPages.map((p) => p.text).join('\n\n--- Page Break ---\n\n');
+  const fullText = finalPages.map((page) => page.text).join('\n\n--- Page Break ---\n\n');
   return {
     pdfPath,
     totalPages,
     pages: finalPages,
     fullText,
+    warnings,
     structured: parseStructuredLegalEntities(fullText),
   };
 }
@@ -135,11 +171,11 @@ export function parseStructuredLegalEntities(fullText) {
   const lines = fullText.split('\n').map((l) => l.trim()).filter(Boolean);
 
   // 1. Caption & Case Number
-  const caseNoMatch = fullText.match(/(\d{1,2}[A-Z]{0,2}-[A-Z]{2,4}(?:-[A-Z0-9]+)*-\d+)/i);
+  const caseNoMatch = fullText.match(/(\d{1,2}[A-Z]{0,2}-[A-Z]{2,4}(?:-[A-Z]{2,4})?-\d{2,4}-\d+)/i);
   const caseNumber = caseNoMatch ? caseNoMatch[1].toUpperCase() : null;
 
   // 2. County / District
-  const countyMatch = fullText.match(/COUNTY OF\s+([A-Z\s]+)/i);
+  const countyMatch = fullText.match(/COUNTY OF[ \t]+([A-Z][A-Z ]{1,40})(?=\r?\n|$)/i);
   const county = countyMatch ? countyMatch[1].trim() : null;
   const districtMatch = fullText.match(/([A-Z0-9]+)\s+JUDICIAL DISTRICT/i);
   const judicialDistrict = districtMatch ? districtMatch[1].trim() : null;
@@ -188,32 +224,41 @@ export function parseStructuredLegalEntities(fullText) {
  * Process and save text and structured metadata alongside the PDF.
  */
 export function preprocessPdf(pdfPath, options = {}) {
-  const result = extractPdfTextHybrid(pdfPath, options);
+  if (!fs.existsSync(pdfPath) || !fs.statSync(pdfPath).isFile()) {
+    throw new Error(`PDF file not found: ${pdfPath}`);
+  }
 
+  const pdfBuffer = fs.readFileSync(pdfPath);
+  const sha256 = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
+  const result = extractPdfTextHybrid(pdfPath, options);
   const baseName = pdfPath.replace(/\.pdf$/i, '');
   const txtPath = `${baseName}.txt`;
   const jsonPath = `${baseName}.dossier.json`;
+  const documentId = options.documentId || sha256.slice(0, 24);
 
-  // Generate comprehensive filing dossier with NER, Anatomy, and LLM context chunks
   const dossier = processFilingToDossier(result.fullText, {
-    caseNumber: result.structured.caseNumber,
+    caseNumber: options.caseNumber || result.structured.caseNumber,
+    documentId,
     filename: path.basename(pdfPath),
+    sha256,
+    sizeBytes: pdfBuffer.length,
     totalPages: result.totalPages,
+    filedDate: options.filedDate || '',
     sourceIndex: options.index || null,
   });
 
-  // Attach page extraction source details
-  dossier.pageBreakdown = result.pages.map((p) => ({
-    pageNum: p.pageNum,
-    source: p.source,
-    wordCount: p.wordCount,
+  dossier.pageBreakdown = result.pages.map((page) => ({
+    pageNum: page.pageNum,
+    source: page.source,
+    wordCount: page.wordCount,
   }));
+  dossier.extractionWarnings = result.warnings;
 
-  fs.writeFileSync(txtPath, result.fullText, 'utf-8');
-  fs.writeFileSync(jsonPath, JSON.stringify(dossier, null, 2), 'utf-8');
+  writeFileAtomic(txtPath, result.fullText);
+  writeFileAtomic(jsonPath, `${JSON.stringify(dossier, null, 2)}\n`);
 
   console.log(
-    `  [NLP & OCR] Processed ${path.basename(pdfPath)} -> .txt (${result.fullText.length} chars) & .dossier.json (${dossier.llmContext.chunks.length} LLM chunks)`
+    `  [NLP & OCR] Processed ${path.basename(pdfPath)} -> .txt (${result.fullText.length} chars) & .dossier.json (${dossier.llmContext.chunks.length} chunks)`
   );
   return { ...result, dossier };
 }

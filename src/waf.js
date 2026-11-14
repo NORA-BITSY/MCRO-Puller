@@ -1,8 +1,8 @@
 import { CONFIG } from './config.js';
 
 /**
- * Sleep for a random jittered duration between min and max ms.
- * Emulates human pauses to avoid rate limiting and anomaly detection.
+ * Sleep for a random duration between requests. This is cooperative rate
+ * limiting, not a guarantee that a request is permitted or will avoid blocks.
  */
 export async function sleepJitter(minMs = CONFIG.delays.minDelayMs, maxMs = CONFIG.delays.maxDelayMs) {
   const actualMin = Math.min(minMs, maxMs);
@@ -63,24 +63,42 @@ export async function checkWafBlock(page) {
 
     return { blocked: false };
   } catch (err) {
-    return { blocked: false };
+    return {
+      blocked: true,
+      reason: `Unable to inspect page health: ${err.message}`,
+    };
   }
 }
 
 /**
- * Normalize MCRO accessible case numbers (e.g., "6 7 dash C V dash 2 6 dash 3 0 0" -> "67-CV-26-300").
+ * Normalize a Minnesota case number and take only the first complete case
+ * number when rendered headings repeat accessible text.
  */
 export function normalizeCaseNumber(raw) {
   if (!raw) return '';
-  const converted = raw
+  let converted = raw
     .replace(/\bdash\b/gi, '-')
     .replace(/\s+/g, '')
     .toUpperCase();
 
-  // Match Minnesota standard court case pattern (e.g., 67-CV-26-300, 27-CV-HC-26-7572, 69VI-VB-26-3230)
-  const match = converted.match(/(\d{1,2}[A-Z]{0,2}-[A-Z]{2,4}(?:-[A-Z0-9]+)*-\d+)/i);
-  if (match) {
-    return match[1].toUpperCase();
+  if (converted.length % 2 === 0) {
+    const midpoint = converted.length / 2;
+    if (converted.slice(0, midpoint) === converted.slice(midpoint)) {
+      converted = converted.slice(0, midpoint);
+    }
   }
-  return converted;
+
+  const match = converted.match(/\d{1,2}[A-Z]{0,2}-[A-Z]{2,4}(?:-[A-Z]{2,4})?-\d{2,4}-\d+/);
+  return match ? match[0] : converted;
+}
+
+export function caseNumbersEqual(left, right) {
+  const canonicalize = (value) => {
+    const parts = normalizeCaseNumber(value).split('-');
+    if (parts.length < 4) return normalizeCaseNumber(value);
+    parts[parts.length - 1] = String(Number.parseInt(parts.at(-1), 10));
+    parts[parts.length - 2] = String(Number.parseInt(parts.at(-2), 10));
+    return parts.join('-');
+  };
+  return canonicalize(left) === canonicalize(right);
 }

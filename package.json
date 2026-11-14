@@ -1,7 +1,7 @@
 {
   "name": "MCRO-Puller",
-  "version": "1.0.0",
-  "description": "Autonomous Minnesota Court Records Online (MCRO) WAF-safe document puller",
+  "version": "1.2.0",
+  "description": "Rate-limited Minnesota Court Records Online public-document synchronizer",
   "main": "cli.js",
   "bin": {
     "mcro": "./cli.js"
@@ -10,9 +10,10 @@
     "start": "node cli.js",
     "search": "node cli.js search",
     "download": "node cli.js download-case",
-    "crawl": "node cli.js crawl",
     "verify": "node cli.js verify",
-    "status": "node cli.js status"
+    "status": "node cli.js status",
+    "check": "node --check cli.js && node --test",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",

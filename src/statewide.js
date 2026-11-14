@@ -1,6 +1,8 @@
+import { CONFIG } from './config.js';
 import { COUNTIES } from './counties.js';
 import { searchCases } from './search.js';
-import { crawlCase, loadState } from './crawler.js';
+import { crawlCase } from './crawler.js';
+import { loadState } from './state.js';
 import { sleepJitter } from './waf.js';
 
 export const CASE_CATEGORIES = [
@@ -11,7 +13,7 @@ export const CASE_CATEGORIES = [
 ];
 
 /**
- * Generate slice partitions for discovery without hitting the 200-result cap.
+ * Generate county/category/date slices. Capped slices are bisected later.
  */
 export function generatePartitions(options = {}) {
   const {
@@ -40,6 +42,51 @@ export function generatePartitions(options = {}) {
 
   return partitions;
 }
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+export async function discoverPartition(page, partition, maxCasesPerSlice = 200, search = searchCases) {
+  const result = await search(page, {
+    counties: [partition.county],
+    categories: [partition.category],
+    caseStatus: partition.caseStatus,
+    filedDateFrom: partition.filedDateFrom,
+    filedDateTo: partition.filedDateTo,
+    filedDateExact: false,
+  });
+
+  if (!result.truncated && result.cases.length < maxCasesPerSlice) return result.cases;
+
+  const start = parseDate(partition.filedDateFrom);
+  const end = parseDate(partition.filedDateTo);
+  if (!start || !end || start >= end) {
+    throw new Error(
+      `Partition remains capped at ${result.cases.length} results and cannot be split further: ` +
+      `${partition.county}/${partition.category}/${partition.filedDateFrom || 'open'}-${partition.filedDateTo || 'open'}`
+    );
+  }
+
+  const midpoint = new Date(start.getTime() + Math.floor((end.getTime() - start.getTime()) / 2));
+  const rightStart = new Date(midpoint.getTime() + 24 * 60 * 60 * 1000);
+  const left = await discoverPartition(page, {
+    ...partition,
+    filedDateTo: formatDate(midpoint),
+  }, maxCasesPerSlice, search);
+  const right = await discoverPartition(page, {
+    ...partition,
+    filedDateFrom: formatDate(rightStart),
+  }, maxCasesPerSlice, search);
+
+  return [...new Map([...left, ...right].map((item) => [item.caseNumber, item])).values()];
+}
+
 
 /**
  * Autonomous Statewide Discovery & Crawler.
@@ -52,10 +99,12 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
   console.log(`======================================================`);
 
   const page = browserClient.page;
-  const state = loadState();
+  const state = loadState(options.stateFile);
   const maxCasesPerSlice = options.maxCasesPerSlice || 200;
   let totalDiscovered = 0;
   let totalProcessed = 0;
+  const partitionFailures = [];
+  const caseFailures = [];
 
   for (let pIdx = 0; pIdx < partitions.length; pIdx++) {
     const part = partitions[pIdx];
@@ -63,24 +112,18 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
       `\n>>> [Partition ${pIdx + 1}/${partitions.length}] County: ${part.county} | Cat: ${part.category} | Status: ${part.caseStatus}`
     );
 
-    let searchResult;
+    let cases;
     try {
-      searchResult = await searchCases(page, {
-        counties: [part.county],
-        categories: [part.category],
-        caseStatus: part.caseStatus,
-        filedDateFrom: part.filedDateFrom,
-        filedDateTo: part.filedDateTo,
-        filedDateExact: false,
-      });
+      cases = await discoverPartition(page, part, maxCasesPerSlice);
     } catch (err) {
       console.error(`  [Partition Error] Failed to search partition: ${err.message}`);
+      partitionFailures.push({ partition: part, error: err.message });
+      if (err.message.includes('[WAF BLOCKED]')) throw err;
       await sleepJitter();
       continue;
     }
 
-    const cases = searchResult.cases || [];
-    console.log(`  [Partition] Discovered ${cases.length} cases.`);
+    console.log(`  [Partition] Discovered ${cases.length} uncapped case(s).`);
     totalDiscovered += cases.length;
 
     // Process each case in this partition
@@ -96,25 +139,46 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
 
       console.log(`  -> Pulling Case [${cIdx + 1}/${cases.length}]: ${caseNo} (${c.caseTitle || ''})`);
       try {
-        await crawlCase(browserClient, caseNo, options);
-        totalProcessed++;
+        const result = await crawlCase(browserClient, caseNo, options);
+        if (result.success) {
+          totalProcessed++;
+        } else {
+          caseFailures.push({ caseNumber: caseNo, error: result.reason || 'Unknown crawl failure' });
+        }
       } catch (err) {
         console.error(`  [Case Error] Failed pulling ${caseNo}: ${err.message}`);
+        caseFailures.push({ caseNumber: caseNo, error: err.message });
+        if (err.message.includes('[WAF BLOCKED]')) throw err;
       }
 
       // Jitter pause between cases
       const jitter = await sleepJitter();
-      console.log(`  [WAF Safe] Pausing ${Math.round(jitter / 1000)}s...`);
+      console.log(`  [Rate Limit] Pausing ${Math.round(jitter / 1000)}s...`);
     }
 
     // Jitter pause between partitions
     if (pIdx < partitions.length - 1) {
       const pDelay = await sleepJitter(CONFIG.delays.minDelayMs * 1.5, CONFIG.delays.maxDelayMs * 1.5);
-      console.log(`[WAF Safe] Partition complete. Pausing ${Math.round(pDelay / 1000)}s before next slice...`);
+      console.log(`[Rate Limit] Partition complete. Pausing ${Math.round(pDelay / 1000)}s before next slice...`);
     }
   }
 
   console.log(`\n======================================================`);
-  console.log(`[Statewide Crawler] Finished: ${totalDiscovered} cases discovered, ${totalProcessed} processed.`);
+  console.log(`[Statewide Crawler] Finished: ${totalDiscovered} cases discovered, ${totalProcessed} processed, ${partitionFailures.length} failed partition(s), ${caseFailures.length} failed case(s).`);
   console.log(`======================================================`);
+
+  const failures = [
+    ...partitionFailures.map((failure) => ({ type: 'partition', ...failure })),
+    ...caseFailures.map((failure) => ({ type: 'case', ...failure })),
+  ];
+  if (failures.length > 0) {
+    const error = new AggregateError(
+      failures.map((failure) => new Error(failure.error)),
+      `${failures.length} statewide operation(s) failed; the run is incomplete`
+    );
+    error.failures = failures;
+    throw error;
+  }
+
+  return { totalDiscovered, totalProcessed, partitionFailures, caseFailures };
 }

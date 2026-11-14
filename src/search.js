@@ -1,6 +1,16 @@
 import { CONFIG } from './config.js';
-import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber } from './waf.js';
+import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual } from './waf.js';
 import { lookupCounty } from './counties.js';
+
+async function assertSearchPageHealthy(page, context) {
+  const wafCheck = await checkWafBlock(page);
+  if (wafCheck.blocked) throw new Error(`[WAF BLOCKED] ${wafCheck.reason}`);
+
+  const title = await page.title().catch(() => '');
+  if (/error|service unavailable/i.test(title)) {
+    throw new Error(`${context} returned an unexpected page titled \"${title}\" at ${page.url()}`);
+  }
+}
 
 /**
  * Universal Case Search covering ALL MCRO fields.
@@ -31,6 +41,7 @@ export async function searchCases(page, options = {}) {
   console.log('[Search] Opening MCRO Case Search...');
   await page.goto(CONFIG.urls.caseSearch, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
   await ensureTermsAccepted(page);
+  await assertSearchPageHealthy(page, 'Case search');
 
   // 1. CASE NUMBER SEARCH
   if (caseNumber) {
@@ -39,7 +50,15 @@ export async function searchCases(page, options = {}) {
     await tab.click();
     await page.waitForTimeout(500);
     await page.locator('#CaseSearchNumber').fill(caseNumber);
-    return await submitSearchAndParse(page);
+    const result = await submitSearchAndParse(page);
+    const exactCases = result.cases.filter((item) => caseNumbersEqual(item.caseNumber, caseNumber));
+    if (result.cases.length > 0 && exactCases.length === 0) {
+      throw new Error(
+        `MCRO returned non-matching case number(s) for ${normalizeCaseNumber(caseNumber)}: ` +
+        result.cases.map((item) => item.caseNumber).join(', ')
+      );
+    }
+    return { ...result, totalFound: exactCases.length, noResults: exactCases.length === 0, cases: exactCases };
   }
 
   // 2. CITATION NUMBER SEARCH
@@ -184,39 +203,46 @@ async function applyAdditionalSearchOptions(page, options = {}) {
 
   // 2. Categories
   if (categories && categories.length > 0) {
-    const codes = categories.map((c) => c.toUpperCase());
+    const allowed = new Set(['CV', 'CR', 'FAM', 'PR']);
+    const codes = categories.map((category) => String(category).toUpperCase());
+    const invalid = codes.filter((code) => !allowed.has(code));
+    if (invalid.length > 0) throw new Error(`Unknown case categories: ${invalid.join(', ')}`);
+
     await page.evaluate((catCodes) => {
       for (const code of catCodes) {
-        const inp = document.querySelector(`input[name="CaseCategoryKeys"][value="${code}"]`);
-        if (inp) {
-          inp.checked = true;
-          inp.dispatchEvent(new Event('change', { bubbles: true }));
-        }
+        const input = document.querySelector(`input[name="CaseCategoryKeys"][value="${code}"]`);
+        if (!input) throw new Error(`Case category control not found: ${code}`);
+        input.checked = true;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
       }
     }, codes);
   }
 
   // 3. Case Status (0: All, 1: Active, 2: Inactive)
-  if (caseStatus) {
-    let val = '0';
-    if (caseStatus === '1' || caseStatus.toLowerCase() === 'active') val = '1';
-    else if (caseStatus === '2' || caseStatus.toLowerCase() === 'inactive') val = '2';
-    await page.locator('#CaseStatus').selectOption(val).catch(() => {});
+  if (caseStatus !== undefined && caseStatus !== null) {
+    const status = String(caseStatus).toLowerCase();
+    let value = '0';
+    if (status === '1' || status === 'active') value = '1';
+    else if (status === '2' || status === 'inactive') value = '2';
+    else if (status !== '0' && status !== 'all') throw new Error(`Unknown case status: ${caseStatus}`);
+    await page.locator('#CaseStatus').selectOption(value);
   }
 
   // 4. Counties / Court Locations
   if (counties && counties.length > 0 && counties !== 'all') {
-    await page.locator('#mpaLocOptionToggleCounty').click().catch(() => {});
+    await page.locator('#mpaLocOptionToggleCounty').click();
     const countyList = Array.isArray(counties) ? counties : [counties];
-    const codes = countyList.map((c) => lookupCounty(c)?.code).filter(Boolean);
+    const resolved = countyList.map((county) => ({ county, match: lookupCounty(county) }));
+    const invalid = resolved.filter(({ match }) => !match).map(({ county }) => county);
+    if (invalid.length > 0) throw new Error(`Unknown counties: ${invalid.join(', ')}`);
+    const codes = resolved.map(({ match }) => match.code);
 
     await page.evaluate((countyCodes) => {
       for (const code of countyCodes) {
-        const inp = document.querySelector(`input[name="Locations"][value="${code}"]`);
-        if (inp) {
-          inp.checked = true;
-          inp.dispatchEvent(new Event('change', { bubbles: true }));
-        }
+        const input = document.querySelector(`input[name="Locations"][value="${code}"]`);
+        if (!input) throw new Error(`County control not found: ${code}`);
+        input.checked = true;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
       }
     }, codes);
   }
@@ -238,6 +264,7 @@ async function submitSearchAndParse(page) {
   ]);
   await page.waitForTimeout(2000);
   await ensureTermsAccepted(page);
+  await assertSearchPageHealthy(page, 'Case search results');
 
   return await parseSearchResults(page);
 }
@@ -258,6 +285,7 @@ export async function searchHearings(page, options = {}) {
   console.log(`[HearingSearch] Searching: Judge="${judgeName}", Date="${hearingDateFrom}" to "${hearingDateTo}"...`);
   await page.goto(CONFIG.urls.hearingSearch, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
   await ensureTermsAccepted(page);
+  await assertSearchPageHealthy(page, 'Hearing search');
 
   if (judgeName) {
     const joTab = page.locator('#MpaHearingSearchJudicialOfficerTypeTab');
@@ -290,6 +318,22 @@ export async function searchHearings(page, options = {}) {
       }
     }
   }
+  if (counties && counties.length > 0) {
+    const resolved = counties.map((county) => ({ county, match: lookupCounty(county) }));
+    const invalid = resolved.filter(({ match }) => !match).map(({ county }) => county);
+    if (invalid.length > 0) throw new Error(`Unknown counties: ${invalid.join(', ')}`);
+    const codes = resolved.map(({ match }) => match.code);
+    await page.locator('#mpaLocOptionToggleCounty').click();
+    await page.evaluate((countyCodes) => {
+      for (const code of countyCodes) {
+        const input = document.querySelector(`input[name="Locations"][value="${code}"]`);
+        if (!input) throw new Error(`County control not found: ${code}`);
+        input.checked = true;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, codes);
+  }
+
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: CONFIG.delays.searchTimeoutMs }).catch(() => {}),
@@ -297,6 +341,7 @@ export async function searchHearings(page, options = {}) {
   ]);
   await page.waitForTimeout(2000);
   await ensureTermsAccepted(page);
+  await assertSearchPageHealthy(page, 'Hearing search results');
 
   return await parseSearchResults(page);
 }
@@ -308,6 +353,7 @@ export async function searchDocumentDirect(page, caseNumber) {
   console.log(`[Search] Direct DocumentSearch for: "${caseNumber}"...`);
   await page.goto(CONFIG.urls.documentSearch, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
   await ensureTermsAccepted(page);
+  await assertSearchPageHealthy(page, 'Document search');
 
   await page.locator('#CaseNumber').fill(caseNumber);
   await Promise.all([
@@ -316,6 +362,7 @@ export async function searchDocumentDirect(page, caseNumber) {
   ]);
   await page.waitForTimeout(2000);
   await ensureTermsAccepted(page);
+  await assertSearchPageHealthy(page, 'Document search results');
 
   return await parseDocumentSearchResults(page);
 }
@@ -350,7 +397,7 @@ export async function parseSearchResults(page) {
       const noResults =
         bodyText.includes('Your search returned no results') ||
         bodyText.includes('No cases were found');
-      return { totalFound: 0, noResults, cases: [] };
+      return { totalFound: 0, noResults, unexpected: !noResults, cases: [] };
     }
 
     const cards = Array.from(wrapper.children);
@@ -394,9 +441,14 @@ export async function parseSearchResults(page) {
     return {
       totalFound: parsed.length,
       noResults: parsed.length === 0,
+      truncated: parsed.length >= 200,
+      unexpected: false,
       cases: parsed,
     };
   });
+  if (result.unexpected) {
+    throw new Error(`MCRO search results could not be recognized at ${page.url()}`);
+  }
 
   result.cases = result.cases.map((c) => ({
     ...c,
