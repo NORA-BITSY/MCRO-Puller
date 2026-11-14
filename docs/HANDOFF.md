@@ -1,33 +1,33 @@
 # Minnesota-first application handoff
 
-**Minnesota-first local application verified; live collection/cloud operation not yet verified.**
+**Minnesota-first local application and technical feasibility verified; live collection gated on court/operator authorization.**
 
-Controlling release boundary: [WO-MCRO-MN-FIRST-001](WO_MN_FIRST_001.md). [Acceptance](MINNESOTA_ACCEPTANCE.md) records MN-01–08, R1–R8, actual commands/counts, image/fingerprint and external gates. [WORK_ORDER](WORK_ORDER.md) retains all national WO IDs and deferred work.
+Controlling release boundary: [WO-MCRO-MN-FIRST-001](WO_MN_FIRST_001.md) and [WO-MCRO-MN-FEASIBILITY-002](WO_MN_FEASIBILITY_002.md). [Acceptance](MINNESOTA_ACCEPTANCE.md) and [Feasibility](MINNESOTA_FEASIBILITY.md) record MN-01–08, MN-F01–F05, actual commands/counts, browser transport findings, and external gates. [WORK_ORDER](WORK_ORDER.md) retains all national WO IDs and deferred work.
 
 ## Recoverable checkpoint and preserved material
 
 - Repository: `/Users/pat/Projects/MCRO-Puller`; branch `refactor/wo-mcro-national-001`.
-- Original source/test checkpoint `bb88e80` preserved. Application implementation: **`819b512`**; final host-database restart correction and focused acceptance tests: **`e5a1140`**. Documentation follows in a separate local commit. No remote push/publication.
-- Final checks: **252 passed, zero failed/skipped**; build exit0;3infra tests passed. Minnesota offline vertical, actual CLI/HTTP/MCP, process kill/restart, original9PDF reprocessing, mixed-page OCR, durable cap handling, packaged native/browser/PG and isolated backup restore passed. Exact limitations are in ACCEPTANCE, not implied away by the counts.
-- `downloads/67-CV-26-300/` originals/manifests/dossiers and historical session exports remain in place, excluded from commits. No original PDF was moved, rewritten or purged. No blanket reset/clean/stash/schema wipe.
-- Host development database: loopback15439, database`court_dev`, schema`public`, thirteen migrations; persistent files`.runtime/postgres`, generated credentials`.runtime/database.env`/`.runtime/database.json` mode0600. **Never print/share these files.**
-- Copied immutable storage:`.runtime/artifacts`;11verified objects including9original PDFs and2synthetic files. Keep DB and storage together. Retention tests used isolated synthetic resources, not this corpus.
-- Reports/logs remain ignored under`.runtime`: `acceptance-check.log`, `minnesota-acceptance.{log,json}`, `recovery-corpus-report.json`, `acceptance-reprocessing.log`, `container-acceptance.{log,json}`, `local-http-capacity.json`, `implementation-fingerprint.json`. Reports can contain local case IDs/filenames; do not publish them casually.
+- Original source/test checkpoint `bb88e80` preserved. Application implementation: `819b512`; host-database restart correction: `e5a1140`. Feasibility milestone: `WO-MCRO-MN-FEASIBILITY-002`. No remote push/publication.
+- Final checks: **256 passed, zero failed/skipped**; build exit 0; 3 infra tests passed. Repeatable feasibility harness `pnpm feasibility:mn` passed with 100% artifact reconciliation (9 authentic court PDFs replayed from `downloads/67-CV-26-300` and verified by SHA-256) and verified retrieval across compiled CLI, REST HTTP API, and real MCP child-process stdio.
+- `downloads/67-CV-26-300/` originals/manifests/dossiers and historical session exports remain in place, excluded from commits. No original PDF was moved, rewritten or purged.
+- Host development database: loopback 15439, database `court_dev`, schema `public`, thirteen migrations; persistent files `.runtime/postgres`, generated credentials `.runtime/database.env`/`.runtime/database.json` mode 0600. **Never print/share these files.**
+- Copied immutable storage: `.runtime/artifacts`; 11 verified objects including 9 original PDFs and 2 synthetic files.
+- Feasibility artifacts: `.runtime/feasibility/<run-id>/report.json` records machine-readable transport, readiness, reconciliation, search matrix, bulk query isolation, efficiency metrics, and crash recovery evidence.
 
 ## Start the local application
 
-Prerequisites: Node24+, pnpm12.18.0, Poppler(`pdfinfo`,`pdftotext`,`pdftoppm`), Tesseract with English data. Host validation used Poppler26.11.0/Tesseract5.5.4. Browser tests need installed Chrome on macOS or locked Playwright Chromium. No paid model service is required.
+Prerequisites: Node 24+, pnpm 12.18.0, Poppler (`pdfinfo`,`pdftotext`,`pdftoppm`), Tesseract with English data. Standalone browser transport automatically discovers host Google Chrome (`/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` on macOS, or via `COURT_CHROME_BIN`/`CHROME_BIN`).
 
-Terminal1, from the repository:
+Terminal 1, from the repository:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm dev:database
 ```
 
-This reuses the existing isolated persistent cluster/credentials. Do not run a second database process on15439. Ctrl-C stops it gracefully without deleting data. For a new host without supported system Chrome, install the browser once: `pnpm exec playwright install chromium`; Linux also needs its documented browser libraries or the supplied image.
+This reuses the existing isolated persistent cluster/credentials. Do not run a second database process on 15439. Ctrl-C stops it gracefully without deleting data.
 
-Terminal2:
+Terminal 2:
 
 ```sh
 set -a
@@ -44,9 +44,17 @@ node dist/src/platform/courtctl.js sources list
 node dist/src/platform/courtctl.js source caps --state MN
 ```
 
-Migrations are transactional/checksummed; do not edit applied migration bytes. The development role owns only this isolated cluster; it is not the production runtime privilege profile.
+`courtctl doctor` returns rich subsystem discrimination: database reachability and pool metrics, standalone browser availability and system Chrome path, extension bridge CDP limitation diagnosis, source enablement/pause status, credentials presence (without disclosing secrets), storage read/write integrity, worker queue counts, HTTP status, and MCP status.
 
-For repeatable offline acceptance, after building and loading that environment:
+For repeatable feasibility verification in an isolated database schema:
+
+```sh
+pnpm feasibility:mn
+```
+
+This executes all feasibility stages (MN-F01–F05): subsystem readiness, browser transport contracts and isolation, authentic case acquisition for `67-CV-26-300` through durable worker queue and selective OCR, reconciliation table accounting, 7 search modes verification, mixed bulk query error isolation, docket reuse efficiency (`navsAvoided > 0`), and worker crash/recovery.
+
+For repeatable offline acceptance:
 
 ```sh
 pnpm check

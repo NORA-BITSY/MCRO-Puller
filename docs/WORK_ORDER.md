@@ -89,3 +89,14 @@ Each row retains its original ID/dependencies. “Local accepted” means the Mi
 - Infrastructure tests:3 passed,0failed/skipped; local image/native/real PostgreSQL and Terraform validation evidence is recorded in MINNESOTA_ACCEPTANCE. No cloud apply, live court collection or remote publication.
 
 The next product milestone requires Pat's separate source-access decision, not another local architecture redesign. National items deferred above remain in this ledger. Production deployment also requires reviewed runtime grants, release artifacts, owners/budgets, monitoring and restore evidence; configuration alone is not operations verification.
+
+## Milestone WO-MCRO-MN-FEASIBILITY-002: Technical Feasibility Execution
+
+- Milestone order: [WO-MCRO-MN-FEASIBILITY-002](WO_MN_FEASIBILITY_002.md). Detailed technical report: [MINNESOTA_FEASIBILITY.md](MINNESOTA_FEASIBILITY.md).
+- Test baseline: **256 passed, zero failed/cancelled/skipped**; strict typecheck passed; `pnpm test` (256/256), `pnpm accept:mn` (exit 0), `node --test infra/tests/*.test.mjs` (3/3 passed).
+- Added `test/feasibility-transport.test.ts` (4 targeted regressions: browser discovery, terms modal consent enforcement, session-level docket reuse metrics, rich subsystem discrimination in `health`).
+- Browser transport (MN-F01): Standalone Chromium with installed Google Chrome verified; context isolation and request gating verified; Playwriter CDP extension bridge isolated-context limitation diagnosed (`Target.createBrowserContext` unsupported); live portal probe confirms HTTP 200, title, and Terms modal (`#tcModalContent`); automated terms consent refused on user's behalf per mandate (`ensureTermsAccepted` throws `blocked`).
+- End-to-end case acquisition (MN-F02): Authentic grounded case `67-CV-26-300` replayed from `downloads/67-CV-26-300` through `GroundedMinnesotaAdapter` across compiled `courtctl acquire`, durable queue, worker, and artifact storage (9 authentic PDFs verified against ground-truth SHA-256 hashes); text extraction, selective OCR, and chunking completed; verified retrieval across compiled CLI, Fastify HTTP API, and MCP stdio; 100% reconciliation (0 missing, 0 corrupt). Note: these were authentic previously acquired files, not fresh live portal downloads.
+- Search and bulk proof (MN-F03): 7 search modes evaluated and documented; mixed bulk query batch (valid + duplicate + invalid) proves item-level error isolation and lineage without neighboring row failure.
+- Refresh & recovery (MN-F04): Docket reuse efficiency implemented (`navsAvoided > 0`), eliminating redundant search/navigation cycles in `fetchDocument`; scheduled refresh skips unchanged bytes; worker SIGKILL and lease expiry recovery verified without duplicate artifacts.
+- Operability (MN-F05): Rich subsystem readiness in `courtctl doctor`; reproducible `pnpm feasibility:mn` harness verified with retained report `.runtime/feasibility/<run-id>/report.json`.

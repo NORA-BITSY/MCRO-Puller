@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
+import { existsSync } from 'node:fs';
 import { readFile,readdir,realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -9,10 +10,12 @@ import { transaction } from './database.js';
 import { CourtSearchQuerySchema,QueryFiltersSchema,SourceError } from './contracts.js';
 import type { CourtSourceAdapter,CaseObservation,DocumentReference } from './contracts.js';
 import type { ArtifactStore } from './storage.js';
-import { sha256,validatePdf } from './storage.js';
+import { sha256,validatePdf,GcsArtifactStore } from './storage.js';
 import { reconcileObservation,canonicalJson } from './reconcile.js';
 import { processInWorker } from './processing-runner.js';
 import { eventIdentity } from './identity.js';
+import { findSystemChrome } from '../browser.js';
+import { CONFIG } from '../config.js';
 import { readRefreshPolicy,RefreshPolicySchema,RefreshPolicyPatchSchema,scheduleNextRefresh } from './refresh.js';
 import type { RefreshPolicy } from './refresh.js';
 import { settleDiscoveryFailures } from './discovery.js';
@@ -349,7 +352,81 @@ export class CourtService {
       await client.query("INSERT INTO audit_events(actor,action,resource_type,resource_id,details) VALUES('operator','restrict','case',$1,$2)",[caseId,JSON.stringify({reason})]);
     });return {caseId,availability:'restricted'};
   }
-  async health():Promise<unknown>{await this.pool.query('SELECT 1');return {status:'ok',database:'reachable',time:new Date().toISOString()};}
+  async health():Promise<unknown>{
+    await this.pool.query('SELECT 1');
+    const sources = (await this.pool.query<{id:string;enabled:boolean;health:string;paused_until:string|null}>('SELECT id,enabled,health,paused_until FROM sources')).rows;
+    const mnSource = sources.find(s => s.id === 'mn-mcro');
+    const fixtureSource = sources.find(s => s.id === 'independent-fixture');
+    const chrome = findSystemChrome();
+    const mode = process.env.COURT_BROWSER_MODE ?? 'standalone';
+    const headed = process.env.COURT_BROWSER_HEADED === 'true';
+    const sessionFile = process.env.COURT_SESSION_FILE || CONFIG.sessionFile;
+    const sessionPresent = existsSync(sessionFile);
+    const activeJobs = (await this.pool.query<{count:number}>("SELECT count(*)::int AS count FROM jobs WHERE status IN ('running','queued')")).rows[0]?.count ?? 0;
+
+    let storageHealthy = true;
+    try {
+      const probe = await this.store.put(Buffer.from('probe'));
+      await this.store.remove(probe.storageKey);
+    } catch {
+      storageHealthy = false;
+    }
+
+    return {
+      status: 'ok',
+      database: 'reachable',
+      time: new Date().toISOString(),
+      details: {
+        database: {
+          status: 'reachable',
+          pool: { total: this.pool.totalCount, idle: this.pool.idleCount, waiting: this.pool.waitingCount },
+        },
+        browser: {
+          mode,
+          headed,
+          executablePath: chrome ?? null,
+          available: !!chrome,
+          extensionBridge: {
+            supported: false,
+            reason: 'Playwriter CDP bridge cannot create isolated browser context (Target.createBrowserContext unsupported); standalone mode required',
+          },
+        },
+        sources: {
+          'mn-mcro': {
+            durableEnabled: mnSource?.enabled ?? false,
+            processOptIn: process.env.COURT_ALLOW_LIVE_MN === 'true',
+            pausedUntil: mnSource?.paused_until ?? null,
+            readyForLive: (mnSource?.enabled ?? false) && process.env.COURT_ALLOW_LIVE_MN === 'true',
+          },
+          'independent-fixture': {
+            durableEnabled: fixtureSource?.enabled ?? true,
+            ready: true,
+          },
+        },
+        credentials: {
+          apiReadTokenPresent: !!process.env.API_TOKEN_READ,
+          apiWriteTokenPresent: !!process.env.API_TOKEN_WRITE,
+          apiAdminTokenPresent: !!process.env.API_TOKEN_ADMIN,
+          databaseConfigured: !!process.env.COURT_DATABASE_URL,
+          sessionStatePresent: sessionPresent,
+        },
+        storage: {
+          status: storageHealthy ? 'accessible' : 'degraded',
+          type: this.store instanceof GcsArtifactStore ? 'gcs' : 'local',
+        },
+        worker: {
+          activeOrQueuedJobs: activeJobs,
+        },
+        http: {
+          configured: true,
+        },
+        mcp: {
+          configured: true,
+          role: process.env.MCP_ROLE || 'read',
+        },
+      },
+    };
+  }
   async metrics():Promise<unknown>{return {jobs:(await this.pool.query('SELECT status,type,count(*)::int AS count,min(created_at) AS oldest FROM jobs GROUP BY status,type')).rows,cases:(await this.pool.query('SELECT source_id,acquisition_status,count(*)::int AS count,min(last_observed_at) AS oldest_observation FROM cases GROUP BY source_id,acquisition_status')).rows,artifacts:(await this.pool.query('SELECT count(*)::int AS count,coalesce(sum(size_bytes),0)::text AS bytes FROM artifacts')).rows[0],sources:(await this.pool.query('SELECT id,enabled,health,paused_until FROM sources')).rows};}
   async verifyStorage():Promise<unknown>{
     const artifacts=await this.pool.query<{id:string;storage_key:string;sha256:string}>('SELECT id,storage_key,sha256 FROM artifacts');const failures:Record<string,string>[]=[];

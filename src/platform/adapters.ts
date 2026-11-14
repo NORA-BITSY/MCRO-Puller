@@ -73,10 +73,22 @@ export function mapRoa(roa: LegacyRoa): CaseObservation {
   return { sourceId: 'mn-mcro', sourceCaseId: roa.caseInfo.caseNumber, caseNumber: roa.caseInfo.caseNumber, title: roa.caseInfo.caseTitle, court: roa.caseInfo.caseLocation, status: roa.caseInfo.caseStatus, observedAt: now(), complete: entries.every((entry) => entry.identityConfidence !== 'ambiguous'), entries, participants, sections: Object.fromEntries(roa.sections.map((section, index) => [typeof section.id === 'string' ? section.id : `section-${index}`, sanitized(section)])), raw: sanitized({ caseInfo: roa.caseInfo, rawText: roa.rawText }) };
 }
 
+export interface MinnesotaBrowserOptions {
+  mode?: 'extension' | 'standalone' | undefined;
+  headed?: boolean | undefined;
+  sessionPath?: string | undefined;
+  executablePath?: string | undefined;
+}
+
 export class MinnesotaAdapter implements CourtSourceAdapter {
   private client: BrowserClient | undefined;
   private pending: Promise<void> = Promise.resolve();
-  constructor(private readonly mode: 'extension' | 'standalone' = 'standalone') {}
+  private cachedRoa: { caseNumber: string; roa: LegacyRoa; observedAt: number } | undefined;
+  private metrics = { navsAvoided: 0, docketFetches: 0, documentDownloads: 0 };
+  constructor(
+    private readonly mode: 'extension' | 'standalone' = 'standalone',
+    private readonly browserOptions: MinnesotaBrowserOptions = {},
+  ) {}
   metadata(): SourceMetadata { return { id: 'mn-mcro', state: 'MN', name: 'Minnesota Court Records Online', baseUrl: 'https://publicaccess.courts.state.mn.us/', adapterVersion: version, fixture: false,processOptInEnvironment:'COURT_ALLOW_LIVE_MN' }; }
   capabilities(): SourceCapabilities { return capabilities(false); }
   validateSearch(query: unknown): CourtSearchQuery { return validate(query, 'mn-mcro'); }
@@ -86,7 +98,12 @@ export class MinnesotaAdapter implements CourtSourceAdapter {
       let gate: SourceRequestGate | undefined;
       try {
         context.signal?.throwIfAborted();
-        this.client ||= await createBrowserClient({ mode: this.mode });
+        this.client ||= await createBrowserClient({
+          mode: this.mode,
+          headed: this.browserOptions.headed,
+          sessionPath: this.browserOptions.sessionPath,
+          executablePath: this.browserOptions.executablePath,
+        });
         if (context.beforeRequest || context.signal) gate = await installSourceRequestGate(this.client.context, context);
         let value: T;
         try { value = await operation(this.client); }
@@ -132,21 +149,64 @@ export class MinnesotaAdapter implements CourtSourceAdapter {
     if (matches.length !== 1) throw new SourceError('parse_error', 'Case search returned ambiguous matches');
     const roa = legacyRoa.parse(await navigateToCaseDetails(page, matches[0]));
     if (!roa.caseInfo.caseNumber || !caseNumbersEqual(roa.caseInfo.caseNumber, identifier)) throw new SourceError('parse_error', 'Observed docket identity differs from requested case');
+    this.cachedRoa = { caseNumber: identifier, roa, observedAt: Date.now() };
+    this.metrics.docketFetches++;
     return roa;
   }
   async fetchCase(identifier: string, context: AcquisitionContext): Promise<CaseObservation> { return this.exclusive(context, async ({ page }) => mapRoa(await this.docket(page, identifier))); }
   async fetchDocument(reference: DocumentReference, context: AcquisitionContext): Promise<ArtifactObservation> {
     return this.exclusive(context, async ({ page }) => {
       if (reference.availability === 'restricted') throw new SourceError('restricted', 'Document is restricted');
-      const roa = await this.docket(page, reference.caseNumber);
-      const matches = roa.events.flatMap((event) => event.documents.map((document) => documentEvent(event, document))).filter((event) => createDocumentKey(event) === reference.sourceDocumentId);
+      let roa: LegacyRoa;
+      let reused = false;
+      if (
+        this.cachedRoa &&
+        caseNumbersEqual(this.cachedRoa.caseNumber, reference.caseNumber) &&
+        Date.now() - this.cachedRoa.observedAt < 300000 &&
+        !page.isClosed() &&
+        page.url().includes('ViewCaseDetails')
+      ) {
+        roa = this.cachedRoa.roa;
+        reused = true;
+        this.metrics.navsAvoided++;
+      } else {
+        roa = await this.docket(page, reference.caseNumber);
+      }
+      let matches = roa.events.flatMap((event) => event.documents.map((document) => documentEvent(event, document))).filter((event) => createDocumentKey(event) === reference.sourceDocumentId);
+      if (matches.length !== 1 && reused) {
+        this.cachedRoa = undefined;
+        roa = await this.docket(page, reference.caseNumber);
+        matches = roa.events.flatMap((event) => event.documents.map((document) => documentEvent(event, document))).filter((event) => createDocumentKey(event) === reference.sourceDocumentId);
+      }
       if (matches.length !== 1) throw new SourceError(matches.length ? 'parse_error' : 'not_found', 'Document identity could not be uniquely reacquired; refusing ordinal fallback');
-      const acquired = await downloadDocument(page, matches[0], reference.caseNumber);
+      let acquired: Awaited<ReturnType<typeof downloadDocument>> | null = null;
+      try {
+        acquired = await downloadDocument(page, matches[0], reference.caseNumber);
+      } catch (error) {
+        if (reused) {
+          this.cachedRoa = undefined;
+          roa = await this.docket(page, reference.caseNumber);
+          const freshMatches = roa.events.flatMap((event) => event.documents.map((document) => documentEvent(event, document))).filter((event) => createDocumentKey(event) === reference.sourceDocumentId);
+          if (freshMatches.length === 1) {
+            acquired = await downloadDocument(page, freshMatches[0], reference.caseNumber);
+          }
+        }
+        if (!acquired) throw error;
+      }
       if (!acquired) throw new SourceError('retryable', 'Document acquisition returned no artifact');
+      this.metrics.documentDownloads++;
       return { bytes: acquired.buffer, filename: acquired.filename, contentType: 'application/pdf', acquiredAt: now() };
     });
   }
-  async close(): Promise<void> { await this.pending; if (this.client) { await this.client.close(); this.client = undefined; } }
+  async close(): Promise<void> {
+    await this.pending;
+    this.cachedRoa = undefined;
+    if (this.client) {
+      await this.client.close();
+      this.client = undefined;
+    }
+  }
+  getEfficiencyMetrics() { return { ...this.metrics }; }
 }
 
 const assetSchema = z.object({ assetId: z.string().min(1), title: z.string(), file: z.string().optional(), access: z.enum(['available', 'restricted', 'unavailable', 'unknown']) });
@@ -274,7 +334,21 @@ export class IndependentFixtureAdapter implements CourtSourceAdapter {
   async close(): Promise<void> { this.data = undefined; }
 }
 
-export function createAdapters(options: { mode?: 'extension' | 'standalone'; fixturePath?: string } = {}): Map<string, CourtSourceAdapter> {
-  const adapters: CourtSourceAdapter[] = [new MinnesotaAdapter(options.mode), new IndependentFixtureAdapter(options.fixturePath)];
+export function createAdapters(options: {
+  mode?: 'extension' | 'standalone' | undefined;
+  headed?: boolean | undefined;
+  sessionPath?: string | undefined;
+  executablePath?: string | undefined;
+  fixturePath?: string | undefined;
+} = {}): Map<string, CourtSourceAdapter> {
+  const adapters: CourtSourceAdapter[] = [
+    new MinnesotaAdapter(options.mode, {
+      mode: options.mode,
+      headed: options.headed,
+      sessionPath: options.sessionPath,
+      executablePath: options.executablePath,
+    }),
+    new IndependentFixtureAdapter(options.fixturePath),
+  ];
   return new Map(adapters.map((adapter) => [adapter.metadata().id, adapter]));
 }

@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "accept:mn": "node scripts/accept-minnesota.mjs",
+    "feasibility:mn": "node scripts/feasibility-minnesota.mjs",
     "courtctl": "tsx src/platform/courtctl.ts",
     "api": "tsx src/platform/api.ts",
     "mcp": "tsx src/platform/mcp.ts",

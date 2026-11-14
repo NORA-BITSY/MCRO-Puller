@@ -76,16 +76,32 @@ export async function installSourceRequestGate(browserContext, context = {}) {
   };
 }
 
+export function findSystemChrome() {
+  const candidates = [
+    process.env.COURT_CHROME_BIN,
+    process.env.CHROME_BIN,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 /** @returns {Promise<BrowserClient>} */
 
 export async function createBrowserClient(options = {}) {
   requireLiveMn();
-  const mode = options.mode || 'extension'; // 'extension' | 'standalone'
+  const mode = options.mode || (process.env.COURT_BROWSER_MODE === 'extension' ? 'extension' : 'standalone');
   if (!['extension', 'standalone'].includes(mode)) throw new Error(`Unknown browser mode: ${mode}`);
 
   const client = mode === 'extension' ? await createExtensionClient(options) : await createStandaloneClient(options);
   try {
-    await installSourceRequestGate(client.context, options.acquisitionContext || {});
+    const gate = await installSourceRequestGate(client.context, options.acquisitionContext || {});
+    client.gate = gate;
     return client;
   } catch (error) {
     await client.close();
@@ -154,16 +170,20 @@ async function createExtensionClient(options) {
   };
 }
 
-async function createStandaloneClient(options) {
+async function createStandaloneClient(options = {}) {
   const { chromium } = await import('playwright');
 
-  const headed = options.headed ?? false;
-  const sessionPath = options.sessionPath || CONFIG.sessionFile;
+  const headed = options.headed ?? (process.env.COURT_BROWSER_HEADED === 'true');
+  const sessionPath = options.sessionPath || process.env.COURT_SESSION_FILE || CONFIG.sessionFile;
   const storageState = fs.existsSync(sessionPath) ? sessionPath : undefined;
+  const executablePath = options.executablePath || findSystemChrome();
 
   if (options.proxy) throw new Error('MCRO adapter does not support proxy configuration or rotation');
-  console.log(`[Browser] Launching standard Chromium (headed: ${headed})...`);
-  const browser = await chromium.launch({ headless: !headed });
+  console.log(`[Browser] Launching standard Chromium (headed: ${headed}, executable: ${executablePath || 'default'})...`);
+  const browser = await chromium.launch({
+    headless: !headed,
+    ...(executablePath ? { executablePath } : {}),
+  });
 
   const context = await browser.newContext({
     storageState,
@@ -193,8 +213,11 @@ async function createStandaloneClient(options) {
     console.log(`[Browser] Session saved to ${sessionPath}`);
   }
 
+  /** @type {BrowserClient} */
+  let client;
   async function close() {
     try {
+      if (client?.gate) await client.gate.close().catch(() => {});
       if (!page.isClosed()) await page.close();
       await context.close();
       await browser.close();
@@ -203,7 +226,7 @@ async function createStandaloneClient(options) {
     }
   }
 
-  return {
+  client = {
     mode: 'standalone',
     page,
     context,
@@ -212,4 +235,5 @@ async function createStandaloneClient(options) {
     saveSession,
     close,
   };
+  return client;
 }
