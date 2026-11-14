@@ -184,13 +184,16 @@ async function applyAdditionalSearchOptions(page, options = {}) {
 
   // 2. Categories
   if (categories && categories.length > 0) {
-    for (const cat of categories) {
-      const code = cat.toUpperCase();
-      const cb = page.locator(`input[name="CaseCategoryKeys"][value="${code}"]`);
-      if (await cb.isVisible().catch(() => false)) {
-        await cb.check();
+    const codes = categories.map((c) => c.toUpperCase());
+    await page.evaluate((catCodes) => {
+      for (const code of catCodes) {
+        const inp = document.querySelector(`input[name="CaseCategoryKeys"][value="${code}"]`);
+        if (inp) {
+          inp.checked = true;
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       }
-    }
+    }, codes);
   }
 
   // 3. Case Status (0: All, 1: Active, 2: Inactive)
@@ -204,22 +207,18 @@ async function applyAdditionalSearchOptions(page, options = {}) {
   // 4. Counties / Court Locations
   if (counties && counties.length > 0 && counties !== 'all') {
     await page.locator('#mpaLocOptionToggleCounty').click().catch(() => {});
-    await page.waitForTimeout(500);
-
     const countyList = Array.isArray(counties) ? counties : [counties];
-    for (const c of countyList) {
-      const matched = lookupCounty(c);
-      if (matched) {
-        const cb = page.locator(`#${matched.id}`);
-        if (await cb.isVisible().catch(() => false)) {
-          await cb.check();
-        } else {
-          // Check by value
-          const byVal = page.locator(`input[name="Locations"][value="${matched.code}"]`);
-          await byVal.check().catch(() => {});
+    const codes = countyList.map((c) => lookupCounty(c)?.code).filter(Boolean);
+
+    await page.evaluate((countyCodes) => {
+      for (const code of countyCodes) {
+        const inp = document.querySelector(`input[name="Locations"][value="${code}"]`);
+        if (inp) {
+          inp.checked = true;
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
         }
       }
-    }
+    }, codes);
   }
 }
 
