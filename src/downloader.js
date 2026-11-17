@@ -174,6 +174,10 @@ export async function downloadDocument(page, docEvent, caseNumber) {
   const safeCase = safeCaseNumber(caseNumber);
   const response = await page.evaluate(async ({ downloadToken, sourceOrigin, timeoutMs, maxBytes }) => {
     const fail = (code, message) => ({ error: { code, message } });
+    const sizeError = (bytesReceived = 0) => ({
+      ...fail('permanent', 'Document exceeds the 50 MiB response size limit'),
+      bytesReceived,
+    });
     if (!downloadToken) return fail('parse_error', 'Document token was not found');
     const forms = Array.from(document.querySelectorAll('#mpa-roa-case-events-content form[action*="DownloadDocument"]'));
     const matches = forms.filter((candidate) => candidate.querySelector('input[name="DocumentDownloadToken"]')?.value === downloadToken);

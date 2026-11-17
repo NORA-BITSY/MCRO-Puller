@@ -175,7 +175,7 @@ async function createStandaloneClient(options = {}) {
 
   const headed = options.headed ?? (process.env.COURT_BROWSER_HEADED === 'true');
   const sessionPath = options.sessionPath || process.env.COURT_SESSION_FILE || CONFIG.sessionFile;
-  let storageState = fs.existsSync(sessionPath) ? sessionPath : undefined;
+  let storageState = sessionPath && fs.existsSync(sessionPath) ? sessionPath : undefined;
   const executablePath = options.executablePath || findSystemChrome();
 
   // F5 ASM cookies are bound to the exit IP that earned them. When egressing

@@ -113,7 +113,6 @@ export async function processRetentionRequest(pool:Pool,store:ArtifactStore,requ
   z.uuid().parse(requestId);
   await transaction(pool,async client=>{
     await client.query(lockSql);await guard?.(client);
-    if(!(await readRetentionPolicy(client)).enabled)return;
     const request=(await client.query<RequestRow>('SELECT * FROM retention_requests WHERE id=$1 FOR UPDATE',[requestId])).rows[0];
     if(!request)throw new SourceError('not_found','Retention request not found');
     if(request.status!=='scheduled'||request.due_at.getTime()>Date.now())return;
@@ -121,7 +120,7 @@ export async function processRetentionRequest(pool:Pool,store:ArtifactStore,requ
   });
   await transaction(pool,async client=>{
     await client.query(lockSql);await guard?.(client);
-    const policy=await readRetentionPolicy(client);if(!policy.enabled||!policy.artifactGcEnabled)return;
+    const policy=await readRetentionPolicy(client);if(!policy.artifactGcEnabled)return;
     const request=(await client.query<RequestRow>('SELECT * FROM retention_requests WHERE id=$1 FOR UPDATE',[requestId])).rows[0];
     if(!request||request.status!=='cleanup_pending')return;
     const deletions=(await client.query<DeletionRow>("SELECT * FROM retention_artifact_deletions WHERE request_id=$1 AND status='pending' ORDER BY artifact_id FOR UPDATE",[requestId])).rows;
@@ -154,7 +153,6 @@ export async function processRetentionRequest(pool:Pool,store:ArtifactStore,requ
   return readRetentionRequest(pool,requestId);
 }
 export async function processDueRetention(pool:Pool,store:ArtifactStore,options:{limit?:number;guard?:Guard}={}):Promise<RetentionStatus[]>{
-  if(!(await readRetentionPolicy(pool)).enabled)return [];
   const limit=z.number().int().min(1).max(100).parse(options.limit??20);
   const requests=(await pool.query<{id:string}>("SELECT id FROM retention_requests WHERE status<>'complete' AND due_at<=now() ORDER BY due_at,id LIMIT $1",[limit])).rows;
   const results:RetentionStatus[]=[];

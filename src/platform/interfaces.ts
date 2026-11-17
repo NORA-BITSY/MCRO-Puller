@@ -16,8 +16,8 @@ export type InterfaceService = Pick<CourtService,
 export type Role = 'read' | 'acquire' | 'admin';
 export type Environment = Record<string, string | undefined>;
 export type ApiTokens = Record<Role, string>;
-export const MAX_BODY_BYTES = 2 * 1024 * 1024;
-export const MAX_BATCH_QUERIES = 1000;
+export const MAX_BODY_BYTES = 100 * 1024 * 1024;
+export const MAX_BATCH_QUERIES = 100000;
 
 export class BoundaryError extends Error {
   constructor(public readonly statusCode: number, public readonly code: string, message: string) {

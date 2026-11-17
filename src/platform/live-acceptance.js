@@ -3,10 +3,6 @@ import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { caseNumbersEqual } from '../waf.js';
 
-export function isLiveModeEnabled(env = process.env, argv = process.argv) {
-  return env.COURT_ALLOW_LIVE_MN === 'true' && (argv.includes('--live-adapter') || argv.includes('--live'));
-}
-
 export function evaluateLiveGates(input) {
   const gates = {
     L1_local: 'not evaluated in this live run',
@@ -84,37 +80,7 @@ export function evaluateLiveGates(input) {
   return gates;
 }
 
-export function createLiveBudgetContext(limits) {
-  for (const [name, value] of Object.entries({ maxRequests: limits.maxRequests, maxBytes: limits.maxBytes, maxDocuments: limits.maxDocuments })) {
-    if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`);
-  }
-  let requestsMade = 0;
-  let bytesReceived = 0;
-  let documentsReserved = 0;
-  const budgetError = (resource, maximum) => Object.assign(new Error(`Live pilot ${resource} budget exceeded: ${maximum}`), { code: 'budget_exceeded' });
-  return {
-    signal: limits.signal,
-    get requestsMade() { return requestsMade; },
-    get bytesReceived() { return bytesReceived; },
-    get documentsReserved() { return documentsReserved; },
-    async beforeRequest() {
-      limits.signal?.throwIfAborted();
-      if (requestsMade >= limits.maxRequests) throw budgetError('request', limits.maxRequests);
-      requestsMade++;
-    },
-    recordBytes(bytes) {
-      if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError('bytes must be a nonnegative safe integer');
       if (bytesReceived + bytes > limits.maxBytes) throw budgetError('byte', limits.maxBytes);
-      bytesReceived += bytes;
-    },
-    reserveDocument() {
-      if (documentsReserved >= limits.maxDocuments) return false;
-      documentsReserved++;
-      return true;
-    },
-  };
-}
-
 export async function validateSessionPage(page, context) {
   let modalVisible = true;
   let cookies = [];

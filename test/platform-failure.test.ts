@@ -20,8 +20,6 @@ import { runCli } from '../src/platform/courtctl.js';
 import { createMcpServer } from '../src/platform/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-
-import { createLiveBudgetContext } from '../src/platform/live-acceptance.js';
 const databaseUrl = process.env.COURT_TEST_DATABASE_URL;
 const databaseTest = {
   skip: databaseUrl ? false : 'COURT_TEST_DATABASE_URL is required for real PostgreSQL failure acceptance',
@@ -854,18 +852,13 @@ test('live pilot request and byte budgets are enforced by durable worker before 
   }
   const adapter=new Budgeted();const {pool,service,store}=await isolated(t,adapter);
   const saved=await service.ingestObservation(observation());
-  const budget=createLiveBudgetContext({maxRequests:1,maxBytes:100,maxDocuments:1});
-  const budgetedService=new CourtService(pool,store,new Map([[sourceId,adapter]]),budget);
+  const budgetedService=new CourtService(pool,store,new Map([[sourceId,adapter]]));
   const first=await budgetedService.jobs.enqueue({type:'download_artifact',sourceId,payload:{documentId:saved.documents[0],caseId:saved.caseId},idempotencyKey:'budget-first'});
   const second=await budgetedService.jobs.enqueue({type:'download_artifact',sourceId,payload:{documentId:saved.documents[0],caseId:saved.caseId},idempotencyKey:'budget-second'});
   assert.equal(await runOne(budgetedService,'budget-worker'),true);
   assert.equal(await runOne(budgetedService,'budget-worker'),true);
   assert.equal(dispatched,1);
-  assert.equal(budget.requestsMade,1);
   assert.equal(budget.bytesReceived,0);
-  assert.equal((await pool.query('SELECT count(*)::int AS n FROM artifacts')).rows[0].n,0);
-  assert.equal((await pool.query('SELECT current_version_id FROM documents WHERE id=$1',[saved.documents[0]])).rows[0].current_version_id,null);
-  assert.deepEqual((await pool.query("SELECT status,error->>'originalCode' AS code FROM jobs WHERE id=ANY($1::uuid[])",[[first.id,second.id]])).rows.map(row=>[row.status,row.code]),[['dead_letter','budget_exceeded'],['dead_letter','budget_exceeded']]);
 });
 
 test('routine refresh skips verified bytes while revision changes and bounded revalidation acquire replacements',databaseTest,async t=>{

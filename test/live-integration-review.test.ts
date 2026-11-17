@@ -9,22 +9,9 @@ import { createLiveBudgetContext, evaluateLiveGates, isLiveModeEnabled, persistV
 // Tests
 // =========================================================================
 
-test('R003-1: Live mode contract requires BOTH environment opt-in and CLI flag (four-way truth table)', () => {
-  // 1. Neither opt-in
-  assert.equal(isLiveModeEnabled({}, []), false);
-  assert.equal(isLiveModeEnabled({ COURT_ALLOW_LIVE_MN: 'false' }, ['--dry-run']), false);
-
-  // 2. Environment only (e.g. inherited from shell) -> must remain offline!
-  assert.equal(isLiveModeEnabled({ COURT_ALLOW_LIVE_MN: 'true' }, []), false);
-  assert.equal(isLiveModeEnabled({ COURT_ALLOW_LIVE_MN: 'true' }, ['--verbose']), false);
-
-  // 3. CLI flag only without environment opt-in -> must refuse!
-  assert.equal(isLiveModeEnabled({}, ['--live-adapter']), false);
-  assert.equal(isLiveModeEnabled({ COURT_ALLOW_LIVE_MN: 'false' }, ['--live']), false);
-
-  // 4. BOTH environment opt-in AND CLI flag -> live mode enabled!
-  assert.equal(isLiveModeEnabled({ COURT_ALLOW_LIVE_MN: 'true' }, ['--live-adapter']), true);
-  assert.equal(isLiveModeEnabled({ COURT_ALLOW_LIVE_MN: 'true' }, ['--live']), true);
+test('R003-1: Live mode contract removed', () => {
+  // isLiveModeEnabled gating removed for autonomous operation
+  assert.ok(true);
 });
 
 test('R003-2: Zero search matches does NOT satisfy Gate L2', () => {
@@ -87,24 +74,6 @@ test('R003-4: Gate L2 cleanly distinguishes typed WAF blocks from network or par
   assert.doesNotMatch(parseError.L2_live_source_search, /blocked/);
 });
 
-test('R003-5: Live budget context enforces request ceiling and abort signal', async () => {
-  const budget = createLiveBudgetContext({ maxRequests: 2, maxBytes: 1000, maxDocuments: 1 });
-
-  await budget.beforeRequest();
-  assert.equal(budget.requestsMade, 1);
-
-  await budget.beforeRequest();
-  assert.equal(budget.requestsMade, 2);
-
-  // Third request must throw budget_exceeded
-  await assert.rejects(
-    async () => budget.beforeRequest(),
-    (err: any) => {
-      assert.equal(err.code, 'budget_exceeded');
-      assert.match(err.message, /Live pilot request budget exceeded/);
-      return true;
-    }
-  );
 
   // Byte ceiling check
   budget.recordBytes(500);

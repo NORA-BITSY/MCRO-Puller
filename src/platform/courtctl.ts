@@ -47,7 +47,7 @@ Source search queues observation only; acquire queues acquisition. Neither impli
 `;
 
 export function parseBatch(content: string, format: string): z.infer<typeof bulkSchema> {
-  if (Buffer.byteLength(content) > MAX_BODY_BYTES) throw new Error('Batch exceeds 2 MiB');
+  if (Buffer.byteLength(content) > MAX_BODY_BYTES) throw new Error('Batch exceeds 100 MiB');
   let input: unknown;
   if (format === 'json') {
     const value: unknown = JSON.parse(content);
@@ -80,7 +80,7 @@ async function readBatchFile(path: string): Promise<string> {
     for await (const chunk of stream) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       size += bytes.length;
-      if (size > MAX_BODY_BYTES) throw new Error('Batch exceeds 2 MiB');
+      if (size > MAX_BODY_BYTES) throw new Error('Batch exceeds 100 MiB');
       chunks.push(bytes);
     }
   } finally { stream.destroy(); }

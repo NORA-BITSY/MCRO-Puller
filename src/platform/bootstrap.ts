@@ -9,9 +9,8 @@ export async function createApplication():Promise<{service:CourtService;close:()
   const mode=process.env.COURT_BROWSER_MODE??'standalone';
   if(mode!=='standalone'&&mode!=='extension')throw new Error('COURT_BROWSER_MODE must be standalone or extension');
   const headed=process.env.COURT_BROWSER_HEADED==='true';
-  const sessionPath=process.env.COURT_SESSION_FILE;
   const executablePath=process.env.COURT_CHROME_BIN;
-  const adapters=createAdapters({mode,headed,sessionPath,executablePath,...(process.env.COURT_FIXTURE_PATH?{fixturePath:process.env.COURT_FIXTURE_PATH}:{})});
+  const adapters=createAdapters({mode,headed,executablePath,...(process.env.COURT_FIXTURE_PATH?{fixturePath:process.env.COURT_FIXTURE_PATH}:{})});
   const store=process.env.COURT_GCS_BUCKET?new GcsArtifactStore(process.env.COURT_GCS_BUCKET):new LocalArtifactStore(process.env.COURT_STORAGE_DIR??'.runtime/artifacts');
   const service=new CourtService(pool,store,adapters);
   try{await service.registerSources();}catch(error){await pool.end();throw error;}

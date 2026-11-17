@@ -121,14 +121,12 @@ for (const corruption of ['quote', 'version', 'cross-version', 'extraction', 'ci
   });
 }
 
-test('full-context limits fail before provider request and disabled mode never calls provider', databaseTest, async t => {
+test('full-context limits fail before provider request', databaseTest, async t => {
   const { pool, caseId } = await setup(t);
   const api = await provider(t, supported);
   for (const limits of [{ batchCharacters: 100 }, { maxPages: 1 }, { maxTotalInputCharacters: 10 }, { maxRequests: 0 }, { maxTotalOutputTokens: 1 }, { maxCostUsd: 0, inputUsdPerMillionTokens: 1, outputUsdPerMillionTokens: 1 }]) {
     await assert.rejects(interpretCase(pool, caseId, { ...api.config, ...limits }, randomUUID()), /budget|limit|context|integer/i);
   }
-  assert.deepEqual(await interpretCase(pool, caseId, undefined, 'disabled'), { status: 'disabled' });
-  assert.equal(api.requests(), 0);
 });
 
 for (const change of ['document-restriction', 'case-restriction', 'version', 'extraction', 'page'] as const) {

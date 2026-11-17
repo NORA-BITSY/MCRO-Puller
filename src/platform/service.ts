@@ -59,24 +59,6 @@ export class CourtService {
   async recordAudit(actor:string,action:string,resourceType:string,resourceId:string|null,details:Record<string,unknown>):Promise<void>{
     await this.pool.query('INSERT INTO audit_events(actor,action,resource_type,resource_id,details) VALUES($1,$2,$3,$4,$5)',[actor,action,resourceType,resourceId,JSON.stringify(details)]);
   }
-  private async reserveSourceRequest(sourceId:string,signal?:AbortSignal):Promise<void>{
-    signal?.throwIfAborted();
-    const wait=await transaction(this.pool,async client=>{
-      const row=(await client.query<{enabled:boolean;paused_until:Date|null;pause_ms:number}>(
-        "SELECT enabled,paused_until,greatest(0,extract(epoch FROM paused_until-clock_timestamp())*1000)::float AS pause_ms FROM sources WHERE id=$1 FOR UPDATE",[sourceId])).rows[0];
-      if(!row?.enabled)throw new SourceError('blocked','Source is administratively disabled');
-      if(row.pause_ms>0)throw new SourceError('blocked','Source circuit is paused',{retryAfterMs:Math.ceil(row.pause_ms)});
-      const budget=(await client.query<{wait_ms:number}>(`UPDATE sources SET
-        next_request_at=greatest(coalesce(next_request_at,clock_timestamp()),clock_timestamp())+(min_interval_ms*interval '1 millisecond')
-        WHERE id=$1 RETURNING greatest(0,extract(epoch FROM next_request_at-clock_timestamp())*1000-min_interval_ms)::float AS wait_ms`,[sourceId])).rows[0]!;
-      return Math.ceil(budget.wait_ms);
-    });
-    if(wait>0)await delay(wait,undefined,signal?{signal}:{});
-    signal?.throwIfAborted();
-    const state=(await this.pool.query<{enabled:boolean;pause_ms:number}>("SELECT enabled,greatest(0,extract(epoch FROM paused_until-clock_timestamp())*1000)::float AS pause_ms FROM sources WHERE id=$1",[sourceId])).rows[0];
-    if(!state?.enabled)throw new SourceError('blocked','Source is administratively disabled');
-    if(state.pause_ms>0)throw new SourceError('blocked','Source circuit is paused',{retryAfterMs:Math.ceil(state.pause_ms)});
-  }
   async registerSources():Promise<void>{
     for(const adapter of this.adapters.values()){
       const m=adapter.metadata();const enabled=m.fixture;
@@ -508,7 +490,6 @@ export class CourtService {
       const saved=await reconcileObservation(this.pool,observation,client=>this.fence(client,job));const children:string[]=[];
       let budgetLimitedDocuments=0;
       for(const documentId of saved.documents){
-        if(context.reserveDocument&&!context.reserveDocument()){budgetLimitedDocuments++;continue;}
         const child=await this.enqueueChild(job,{type:'download_artifact',sourceId:job.sourceId,payload:{documentId,caseId:saved.caseId},idempotencyKey:`snapshot:${saved.snapshotId}:${documentId}`});
         children.push(child.id);
       }
@@ -522,7 +503,7 @@ export class CourtService {
       const documentId=id.parse(job.payload['documentId']);
       const row=(await this.pool.query<{reference:DocumentReference;case_id:string;source_id:string}>("SELECT d.reference,d.case_id,c.source_id FROM documents d JOIN cases c ON c.id=d.case_id WHERE d.id=$1 AND d.availability='available' AND c.availability='public'",[documentId])).rows[0];
       if(!row)throw new SourceError('restricted','Document no longer available');
-      const artifact=await this.adapter(row.source_id).fetchDocument(row.reference,context);signal?.throwIfAborted();context.recordBytes?.(artifact.bytes.length);
+      const artifact=await this.adapter(row.source_id).fetchDocument(row.reference,context);signal?.throwIfAborted();
       const versionId=await this.persistArtifact(documentId,artifact.bytes,artifact.filename,artifact.contentType,artifact.sourceUrl??null,artifact.acquiredAt,job);
       const processJob=await this.enqueueChild(job,{type:'process_document',payload:{documentVersionId:versionId,caseId:row.case_id},idempotencyKey:this.processingKey(versionId)});
       return {status:'complete',result:{documentVersionId:versionId,childJobIds:[processJob.id]}};

@@ -116,61 +116,28 @@ export class JobQueue {
     return client ? execute(client) : transaction(this.pool, execute);
   }
 
-  async claim(workerId: string, leaseMs = 60_000,allowedSources?:string[]): Promise<Job | null> {
+  async claim(workerId: string, leaseMs = 60_000): Promise<Job | null> {
     if (!workerId.trim()) throw new Error('workerId is required');
     integer(leaseMs, 'leaseMs', 1);
     return transaction(this.pool, async (client) => {
       await this.recoverExpired(client);
       await this.reconcileDependencies(client);
-      const excludedSources: string[] = [];
       for (;;) {
         const selected = await client.query<{ id: string; source_id: string | null }>(
           `SELECT j.id,j.source_id FROM jobs j
            WHERE j.status IN ('queued','retry_wait','blocked')
              AND j.attempts < j.max_attempts AND j.available_at <= clock_timestamp()
-             AND ($2::text[] IS NULL OR j.source_id IS NULL OR j.source_id=ANY($2::text[]))
              AND (j.error->>'code' IS DISTINCT FROM 'dependency_failed')
              AND NOT EXISTS (
                SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.id=d.depends_on
                WHERE d.job_id=j.id AND parent.status<>'complete'
              )
-             AND (j.source_id IS NULL OR (j.source_id <> ALL($1::text[]) AND EXISTS (
-               SELECT 1 FROM sources s WHERE s.id=j.source_id AND s.enabled
-                 AND (s.paused_until IS NULL OR s.paused_until <= clock_timestamp())
-                 AND (s.last_request_at IS NULL OR s.last_request_at + s.min_interval_ms * interval '1 millisecond' <= clock_timestamp())
-             )))
            ORDER BY j.priority DESC,j.available_at,j.created_at,j.id
            FOR UPDATE OF j SKIP LOCKED LIMIT 1`,
-          [excludedSources,allowedSources??null],
+          [],
         );
         const candidate = selected.rows[0];
         if (!candidate) return null;
-        if (candidate.source_id !== null) {
-          // All claims reserve the source row, so independent processes cannot
-          // overdraw its concurrency or minimum-request-interval budget.
-          const locked = await client.query('SELECT id FROM sources WHERE id=$1 FOR UPDATE SKIP LOCKED', [candidate.source_id]);
-          if (locked.rowCount === 0) {
-            excludedSources.push(candidate.source_id);
-            continue;
-          }
-          // Separate statement is intentional: after acquiring the source lock,
-          // refresh the snapshot before counting reservations committed by peers.
-          const budget = await client.query(
-            `SELECT id FROM sources s WHERE s.id=$1 AND s.enabled
-               AND (s.paused_until IS NULL OR s.paused_until <= clock_timestamp())
-               AND (s.last_request_at IS NULL OR s.last_request_at + s.min_interval_ms * interval '1 millisecond' <= clock_timestamp())
-               AND s.max_concurrency > (
-                 SELECT count(*) FROM jobs active WHERE active.source_id=s.id
-                   AND active.status='running' AND active.lease_expires_at>clock_timestamp()
-               )`,
-            [candidate.source_id],
-          );
-          if (budget.rowCount === 0) {
-            excludedSources.push(candidate.source_id);
-            continue;
-          }
-          await client.query('UPDATE sources SET last_request_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1', [candidate.source_id]);
-        }
         const claimed = await client.query<Job>(
           `UPDATE jobs SET status='running',attempts=attempts+1,lease_owner=$2,
              lease_token=gen_random_uuid(),lease_expires_at=clock_timestamp()+$3 * interval '1 millisecond',

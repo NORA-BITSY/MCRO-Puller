@@ -420,7 +420,7 @@ if (!process.argv.includes('--crash-worker')) {
       ? new MinnesotaAdapter('standalone', { headed: process.env.COURT_BROWSER_HEADED === 'true', sessionPath: sessionFile, proxy })
       : new GroundedMinnesotaAdapter();
     const adapter = sourceAdapter;
-    const service = new CourtService(pool, store, new Map([['mn-mcro', adapter]]), liveBudget);
+    const service = new CourtService(pool, store, new Map([['mn-mcro', adapter]]));
     await service.registerSources();
 
     // Keep configured source pacing for live traffic. Offline replay is local.

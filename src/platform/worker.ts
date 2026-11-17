@@ -9,7 +9,7 @@ import { settleDiscoveryFailures } from './discovery.js';
 
 export async function runOne(service:CourtService,workerId=`worker-${randomUUID()}`,shutdown?:AbortSignal):Promise<boolean>{
   const leaseMs=120000;
-  const job=await service.jobs.claim(workerId,leaseMs,service.allowedSourceIds());
+  const job=await service.jobs.claim(workerId,leaseMs);
   if(!job||!job.leaseToken)return false;
   const token=job.leaseToken;const controller=new AbortController();
   const cancel=()=>controller.abort();shutdown?.addEventListener('abort',cancel,{once:true});if(shutdown?.aborted)cancel();

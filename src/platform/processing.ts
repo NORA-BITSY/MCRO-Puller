@@ -203,7 +203,6 @@ const systemPrompt = 'You extract evidence-grounded statements from one court fi
 /** Shared provider transport; callers own scope, preflight budgets and evidence validation. */
 export async function requestStructuredInterpretation(input: string, config: LlmConfig,
   systemInstruction: string, schema: Record<string, unknown>, schemaName = 'court_interpretation'): Promise<unknown> {
-  if (!config.enabled) throw new Error('LLM interpretation is disabled');
   if (!config.model.trim()) throw new Error('LLM model is required');
   const timeoutMs = config.timeoutMs ?? 60000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000) throw new Error('LLM timeout must be between 1 and 120000ms');
@@ -237,7 +236,6 @@ async function interpretBatch(pages: Page[], spans: PageSpan[], config: LlmConfi
 }
 
 export async function interpretPages(pages: Page[], config: LlmConfig): Promise<z.infer<typeof interpretationSchema>> {
-  if (!config.enabled) return { assertions: [] };
   if (!config.model.trim()) throw new Error('LLM model is required');
   const batches = planInterpretationBatches(pages, config);
   const assertions: z.infer<typeof interpretationSchema>['assertions'] = [];
@@ -257,7 +255,7 @@ export async function processDocument(bytes: Buffer, meta: { documentVersionId: 
     const result = analyzePages(pages, meta.filename);
     result.warnings.push(...extracted.warnings);
     const config = options.llm;
-    if (config?.enabled) {
+    if (config) {
       const interpretation = await interpretPages(pages, config);
       result.assertions = interpretation.assertions.map(assertion => ({ ...assertion, data: { method: 'llm', documentVersionId: meta.documentVersionId, verifiedFact: false, entailmentVerified: false, scope: 'submitted_page_spans' } }));
       result.model = `${config.provider}:${config.model}`;
