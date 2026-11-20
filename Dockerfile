@@ -12,7 +12,6 @@ RUN pnpm build && pnpm prune --prod
 FROM node:24.22.2-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9 AS runtime
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
-    PORT=3000 \
     COURT_ALLOW_LIVE_MN=false \
     COURT_STORAGE_DIR=/var/lib/court \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \

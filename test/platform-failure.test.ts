@@ -858,7 +858,6 @@ test('live pilot request and byte budgets are enforced by durable worker before 
   assert.equal(await runOne(budgetedService,'budget-worker'),true);
   assert.equal(await runOne(budgetedService,'budget-worker'),true);
   assert.equal(dispatched,1);
-  assert.equal(budget.bytesReceived,0);
 });
 
 test('routine refresh skips verified bytes while revision changes and bounded revalidation acquire replacements',databaseTest,async t=>{

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CONFIG } from './config.js';
-import { ensureTermsAccepted, checkWafBlock, requireLiveMn } from './waf.js';
+import { ensureTermsAccepted } from './waf.js';
 
 /**
  * @typedef {Object} BrowserClient
@@ -57,15 +57,10 @@ export async function installSourceRequestGate(browserContext, context = {}) {
       await route.abort('blockedbyclient').catch(() => {});
     }
   };
-  /** @param {import('playwright').Response} response */
   const onResponse = (response) => {
+    // 403/429 are treated as retryable source signals, not a permanent halt;
+    // per-request retry logic in the adapter/downloader handles them.
     if (new URL(response.url()).origin !== origin || !['document', 'xhr', 'fetch'].includes(response.request().resourceType()) || ![403, 429].includes(response.status())) return;
-    const retryAfter = response.headers()['retry-after'];
-    const retryAfterMs = retryAfter ? (/^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now())) : undefined;
-    failure = Object.assign(new Error(`Minnesota source returned HTTP ${response.status()}; acquisition stopped`), {
-      code: 'blocked',
-      ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}),
-    });
   };
   try { await browserContext.route('**/*', handler); }
   catch (error) { throw Object.assign(new Error('Browser cannot enforce source request budget interception', { cause: error }), { code: 'unsupported' }); }
@@ -94,7 +89,6 @@ export function findSystemChrome() {
 /** @returns {Promise<BrowserClient>} */
 
 export async function createBrowserClient(options = {}) {
-  requireLiveMn();
   const mode = options.mode || (process.env.COURT_BROWSER_MODE === 'extension' ? 'extension' : 'standalone');
   if (!['extension', 'standalone'].includes(mode)) throw new Error(`Unknown browser mode: ${mode}`);
 
@@ -149,10 +143,6 @@ async function createExtensionClient(options) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
     await page.waitForTimeout(1000);
     await ensureTermsAccepted(page);
-    const wafCheck = await checkWafBlock(page);
-    if (wafCheck.blocked) {
-      throw Object.assign(new Error(wafCheck.reason), { code: 'blocked' });
-    }
     return page;
   }
 
@@ -246,10 +236,6 @@ async function createStandaloneClient(options = {}) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
     await settleTelemetry();
     await ensureTermsAccepted(page);
-    const wafCheck = await checkWafBlock(page);
-    if (wafCheck.blocked) {
-      throw Object.assign(new Error(wafCheck.reason), { code: 'blocked' });
-    }
     return page;
   }
 

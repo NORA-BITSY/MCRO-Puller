@@ -20,7 +20,7 @@ export function evaluateLiveGates(input) {
   }
 
   const matches = input.searchResults || [];
-  const foundTarget = matches.some((candidate) => caseNumbersEqual(candidate.caseNumber, input.targetCaseNumber));
+  const foundTarget = matches.some((candidate) => caseNumbersEqual(candidate.caseNumber ?? candidate.case_number, input.targetCaseNumber));
   if (!foundTarget) {
     gates.L2_live_source_search = matches.length === 0
       ? 'no_results (target case not found)'
@@ -50,8 +50,8 @@ export function evaluateLiveGates(input) {
   }
   gates.L2_live_source_search = `passed (${observation.entries.length} complete docket entries observed)`;
 
-  if (input.stageFailed === 'download') {
-    gates.L3_live_document = failure('download');
+  if (input.stageFailed === 'download' || input.stageFailed === 'extraction') {
+    gates.L3_live_document = failure(input.stageFailed);
     return gates;
   }
   const document = input.documentObservation;
@@ -80,25 +80,39 @@ export function evaluateLiveGates(input) {
   return gates;
 }
 
-      if (bytesReceived + bytes > limits.maxBytes) throw budgetError('byte', limits.maxBytes);
 export async function validateSessionPage(page, context) {
   let modalVisible = true;
   let cookies = [];
-  let searchElementCount = 0;
+  let searchElementsVisible = false;
   try { modalVisible = await page.locator('#tcModalAcceptBtn').isVisible(); } catch {}
   try { cookies = await context.cookies(); } catch {}
-  try { searchElementCount = await page.locator('#MpaCaseSearchNameTypeTab, #MpaCaseSearchCaseNumberTypeTab, #CaseSearchNumber').count(); } catch {}
-  const hasTermsCookie = cookies.some((cookie) => cookie.name === 'IsAcceptedTerms' || cookie.name.includes('Terms'));
-  const hasSessionCookie = cookies.some((cookie) => cookie.name === 'mcro-session' || cookie.name.includes('AspNetCore') || cookie.name === 'OClmoOot');
-  const hasSearchElements = searchElementCount > 0;
+  try {
+    const searchElements = page.locator('#MpaCaseSearchNameTypeTab, #MpaCaseSearchCaseNumberTypeTab, #CaseSearchNumber');
+    const count = await searchElements.count();
+    for (let index = 0; index < count; index++) {
+      if (await searchElements.nth(index).isVisible()) {
+        searchElementsVisible = true;
+        break;
+      }
+    }
+  } catch {}
+  const hasTermsCookie = cookies.some((cookie) => (cookie.name === 'IsAcceptedTerms' || cookie.name.includes('Terms')) && typeof cookie.value === 'string' && cookie.value.length > 0);
+  const hasSessionCookie = cookies.some((cookie) => (cookie.name === 'mcro-session' || cookie.name.includes('AspNetCore') || cookie.name === 'OClmoOot') && typeof cookie.value === 'string' && cookie.value.length > 0);
   return {
     modalDismissed: !modalVisible,
     hasTermsCookie,
     hasSessionCookie,
-    hasSearchElements,
-    usable: !modalVisible && hasTermsCookie && hasSessionCookie && hasSearchElements,
+    hasSearchElements: searchElementsVisible,
+    usable: !modalVisible && hasTermsCookie && hasSessionCookie && searchElementsVisible,
     cookieCount: cookies.length,
   };
+}
+
+export function validateStoredSessionState(state) {
+  const cookies = state && typeof state === 'object' && Array.isArray(state.cookies) ? state.cookies : [];
+  const hasTermsCookie = cookies.some((cookie) => cookie && (cookie.name === 'IsAcceptedTerms' || typeof cookie.name === 'string' && cookie.name.includes('Terms')) && typeof cookie.value === 'string' && cookie.value.length > 0);
+  const hasSessionCookie = cookies.some((cookie) => cookie && (cookie.name === 'mcro-session' || typeof cookie.name === 'string' && cookie.name.includes('AspNetCore') || cookie.name === 'OClmoOot') && typeof cookie.value === 'string' && cookie.value.length > 0);
+  return { cookieCount: cookies.length, hasTermsCookie, hasSessionCookie, ready: hasTermsCookie && hasSessionCookie };
 }
 
 export async function persistVerifiedSession(targetPath, storageState, validation) {

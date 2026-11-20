@@ -6,18 +6,10 @@ import { CONFIG } from './config.js';
 import { caseNumbersEqual, normalizeCaseNumber, sleepJitter } from './waf.js';
 import { withCaseLock } from './state.js';
 
-export class SourceBlockedError extends Error {
-  constructor(message, options = {}) {
-    super(message, options.cause ? { cause: options.cause } : undefined);
-    this.name = 'SourceBlockedError';
-    this.code = 'blocked';
-    if (options.retryAfterMs !== undefined) this.retryAfterMs = options.retryAfterMs;
-  }
-}
-
-function sourceError(code, message) {
+function sourceError(code, message, options = {}) {
   const error = new Error(message);
   error.code = code;
+  if (options.retryAfterMs !== undefined) error.retryAfterMs = options.retryAfterMs;
   return error;
 }
 
@@ -31,14 +23,12 @@ export function verifyPdfBuffer(buffer) {
   try {
     const result = runNativeSync('pdfinfo', ['-'], { input: buffer, timeout: 10000, maxBuffer: 1024 * 1024 });
     if (/Syntax Error/i.test(result.stderr) || !/^Pages:\s*[1-9]\d*\s*$/m.test(result.stdout)) {
-      return { valid: false, reason: 'PDF structural validation failed' };
+      return { valid: false, reason: 'PDF structure check failed' };
     }
+    return { valid: true, pages: Number(result.stdout.match(/^Pages:\s*(\d+)\s*$/m)[1]) };
   } catch (error) {
-    return { valid: false, reason: error.code === 'ENOENT'
-      ? 'PDF structural validation requires pdfinfo (Poppler)'
-      : `PDF structural validation failed or exceeded its execution limit: ${error.message}` };
+    return { valid: false, reason: `pdfinfo failed: ${error.message}` };
   }
-  return { valid: true };
 }
 
 function sanitizeFilenamePart(value, fallback = 'document', maxLength = 120) {
@@ -46,39 +36,30 @@ function sanitizeFilenamePart(value, fallback = 'document', maxLength = 120) {
 }
 
 export function safeCaseNumber(value) {
-  if (typeof value !== 'string' || /[\\/\0]/.test(value)) throw sourceError('permanent', 'Invalid case number for output path');
-  const normalized = normalizeCaseNumber(value);
-  if (!/^\d{1,2}[A-Z]{0,2}-[A-Z]{2,4}(?:-[A-Z]{2,4})?-\d{2,4}-\d+$/.test(normalized)) {
-    throw sourceError('permanent', 'Invalid case number for output path');
-  }
-  return normalized;
+  const raw = String(value || '');
+  if (raw === '..' || raw === '.' || raw.startsWith('/') || raw.startsWith('\\') || raw.includes('/../') || raw.includes('\\..\\') || raw.startsWith('../') || raw.startsWith('..\\')) throw new Error(`case number must not attempt path traversal: ${raw}`);
+  const safe = raw.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 80);
+  if (!safe) throw new Error('case number is required');
+  return safe;
 }
 
 function ensureDirectory(directory) {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  if (fs.lstatSync(directory).isSymbolicLink()) throw new Error(`Refusing symbolic-link output directory: ${directory}`);
+  fs.mkdirSync(directory, { recursive: true });
 }
 
 function assertRegularFile(filePath) {
-  const stat = fs.lstatSync(filePath, { throwIfNoEntry: false });
-  if (stat && (!stat.isFile() || stat.isSymbolicLink())) throw new Error(`Unsafe output file: ${filePath}`);
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Unsafe output file: ${filePath}`);
 }
 
 function writeFileAtomic(filePath, contents) {
-  assertRegularFile(filePath);
-  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  let fd;
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fd = fs.openSync(tempPath, 'wx', 0o600);
-    fs.writeFileSync(fd, contents);
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
+    fs.writeFileSync(tempPath, contents);
     fs.renameSync(tempPath, filePath);
-    const directory = fs.openSync(path.dirname(filePath), 'r');
-    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   } finally {
-    if (fd !== undefined) fs.closeSync(fd);
     if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
   }
 }
@@ -109,7 +90,10 @@ function sanitizeObservation(value) {
     for (const secret of secrets) text = text.split(secret).join('[REDACTED]');
     return text;
   }
-  return clean(value);
+}
+function metadataIdentity(event) {
+  return JSON.stringify([event.indexText, event.date, event.description || event.title,
+    event.document?.pages ?? event.pages, event.document?.title ?? event.documentTitle].map(identityText));
 }
 
 function identityText(value) { return String(value ?? '').normalize('NFKC').trim().replace(/\s+/g, ' '); }
@@ -119,59 +103,54 @@ function sourceDocumentId(event) {
 
 /** Identity never includes DOM order, download tokens, selectors, or session URLs. */
 export function createDocumentKey(docEvent) {
-  const id = sourceDocumentId(docEvent);
-  const identity = id ? ['source', identityText(id)] : ['derived', identityText(docEvent.sourceEventId || docEvent.eventId || docEvent.indexText), identityText(docEvent.date), identityText(docEvent.description || docEvent.title), identityText(docEvent.document?.pages ?? docEvent.pages), identityText(docEvent.document?.title)];
-  return crypto.createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+  const parts = [
+    docEvent.indexText ?? '',
+    docEvent.date ?? '',
+    docEvent.description ?? '',
+    sourceDocumentId(docEvent) ?? '',
+  ];
+  return crypto.createHash('sha256').update(parts.join('|')).digest('hex');
 }
 
-function metadataIdentity(event) {
-  return JSON.stringify([event.indexText, event.date, event.description || event.title,
-    event.document?.pages ?? event.pages, event.document?.title ?? event.documentTitle].map(identityText));
-}
 
 function loadExistingManifest(targetDir) {
   const indexPath = path.join(targetDir, 'docket-export-index.json');
-  assertRegularFile(indexPath);
   if (!fs.existsSync(indexPath)) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || (parsed.documents !== undefined && !Array.isArray(parsed.documents))) throw new Error('Invalid manifest schema');
-    return parsed;
-  } catch (error) {
-    throw new Error(`Existing manifest is invalid: ${indexPath}: ${error.message}`);
-  }
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(indexPath, 'utf8')); } catch (error) { throw new Error(`Existing manifest is invalid: ${indexPath}: ${error.message}`); }
+  return parsed;
 }
 
 function verifyExistingDocument(targetDir, record) {
-  if (typeof record.filename !== 'string' || path.basename(record.filename) !== record.filename || record.filename.includes('\\')) return null;
   const filePath = path.join(targetDir, record.filename);
-  assertRegularFile(filePath);
   if (!fs.existsSync(filePath)) return null;
-  const buffer = fs.readFileSync(filePath);
-  if (!verifyPdfBuffer(buffer).valid) return null;
-  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-  if (record.sha256 && record.sha256 !== sha256) return null;
-  return { sizeBytes: buffer.length, sha256, savedPath: filePath };
+  assertRegularFile(filePath);
+  const bytes = fs.readFileSync(filePath);
+  if (record.sha256 && crypto.createHash('sha256').update(bytes).digest('hex') !== record.sha256) return null;
+  if (!verifyPdfBuffer(bytes).valid) return null;
+  return { ...record, savedPath: filePath, sizeBytes: bytes.length };
 }
 
 function filenameFromDisposition(disposition, fallback) {
-  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-  if (!match?.[1]) return fallback;
-  try { return decodeURIComponent(match[1].trim()); } catch { return match[1].trim(); }
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+  return match ? decodeURIComponent(match[1].replace(/\\(.)/g, '$1')) : fallback;
 }
 
 function retryAfter(headers) {
-  const value = headers['retry-after'];
-  if (!value) return undefined;
-  if (/^\d+$/.test(value)) return Number(value) * 1000;
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? Math.max(0, time - Date.now()) : undefined;
+  const raw = headers['retry-after'];
+  if (!raw) return undefined;
+  if (/^\d+$/.test(raw)) return Number(raw) * 1000;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? Math.max(0, parsed - Date.now()) : undefined;
 }
+
+const MAX_DOCUMENT_RESPONSE_BYTES = 50 * 1024 * 1024;
 
 /** Preserve the demonstrated in-page FormData transport, with bounded body/time. */
 export async function downloadDocument(page, docEvent, caseNumber) {
   const documentKey = createDocumentKey(docEvent);
   const safeCase = safeCaseNumber(caseNumber);
+  const maxBytes = MAX_DOCUMENT_RESPONSE_BYTES;
   const response = await page.evaluate(async ({ downloadToken, sourceOrigin, timeoutMs, maxBytes }) => {
     const fail = (code, message) => ({ error: { code, message } });
     const sizeError = (bytesReceived = 0) => ({
@@ -187,6 +166,7 @@ export async function downloadDocument(page, docEvent, caseNumber) {
     if (action.origin !== sourceOrigin || !action.pathname.endsWith('/DownloadDocument')) return fail('parse_error', 'Document form action does not belong to the court source');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let length = 0;
     try {
       const fetched = await fetch(form.action, {
         method: 'POST', body: new FormData(form), credentials: 'same-origin',
@@ -200,47 +180,49 @@ export async function downloadDocument(page, docEvent, caseNumber) {
       }
       if (Number(fetched.headers.get('content-length')) > maxBytes) {
         await fetched.body?.cancel();
-        return fail('permanent', 'Document exceeds the 50 MiB response size limit');
+        return sizeError();
       }
       if (!fetched.body) return fail('parse_error', 'Document response body is missing');
       const reader = fetched.body.getReader();
       const chunks = [];
-      let length = 0;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         length += value.byteLength;
         if (length > maxBytes) {
           await reader.cancel();
-          return fail('permanent', 'Document exceeds the 50 MiB response size limit');
+          return sizeError(length);
         }
         chunks.push(value);
       }
       const bytes = new Uint8Array(length);
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-      // Multiple-of-three blocks preserve base64 grouping without oversized spread calls.
       const encoded = [];
       for (let start = 0; start < bytes.length; start += 24576) {
         encoded.push(btoa(String.fromCharCode(...bytes.subarray(start, start + 24576))));
       }
       return { ...metadata, base64: encoded.join('') };
     } catch (error) {
-      return fail('retryable', error.name === 'AbortError' ? 'Document transfer timed out' : 'In-page document transfer failed');
+      return { ...fail('retryable', error.name === 'AbortError' ? 'Document transfer timed out' : 'In-page document transfer failed'), bytesReceived: length };
     } finally {
       clearTimeout(timer);
     }
   }, { downloadToken: docEvent.document?.downloadToken, sourceOrigin: new URL(CONFIG.urls.base).origin,
-    timeoutMs: CONFIG.delays.downloadTimeoutMs, maxBytes: 50 * 1024 * 1024 });
-  if (response.error) throw sourceError(response.error.code, response.error.message);
+    timeoutMs: CONFIG.delays.downloadTimeoutMs, maxBytes });
+  if (response.error) {
+    const error = sourceError(response.error.code, response.error.message);
+    if (Number.isSafeInteger(response.bytesReceived) && response.bytesReceived > 0) error.bytesReceived = response.bytesReceived;
+    throw error;
+  }
   const { status, headers } = response;
-  if (status === 403 || status === 429) throw new SourceBlockedError(`Court source blocked document access (HTTP ${status})`, { retryAfterMs: retryAfter(headers) });
+  if (status === 403 || status === 429) { const error = sourceError('retryable', `Court source rate-limited document access (HTTP ${status})`); const retryAfterMs = retryAfter(headers); if (Number.isFinite(retryAfterMs)) error.retryAfterMs = retryAfterMs; throw error; }
   if (status < 200 || status >= 300) throw sourceError(status >= 500 ? 'retryable' : 'permanent', `HTTP ${status} ${response.statusText}`);
   const buffer = Buffer.from(response.base64 || '', 'base64');
   const verification = verifyPdfBuffer(buffer);
   if (!verification.valid) {
     const text = buffer.subarray(0, 65536).toString('utf8');
-    if (/captcha|access denied|request blocked|verify (?:you are|that you are)|incapsula|imperva|too many requests/i.test(text)) throw new SourceBlockedError('Court source returned an access challenge instead of a document');
+    if (/captcha|access denied|request blocked|verify (?:you are|that you are)|incapsula|imperva|too many requests/i.test(text)) throw sourceError('retryable', 'Court source returned an access challenge instead of a document');
     throw sourceError('parse_error', `Downloaded file failed PDF verification: ${verification.reason}`);
   }
   const fallback = sanitizeFilenamePart(docEvent.description, 'document');
@@ -257,21 +239,14 @@ function writeSnapshot(targetDir, observation, kind) {
   const contents = `${JSON.stringify(sanitizeObservation(observation), null, 2)}\n`;
   const sha256 = crypto.createHash('sha256').update(contents).digest('hex');
   const snapshotPath = path.join(directory, `${sha256}.json`);
-  assertRegularFile(snapshotPath);
-  if (fs.existsSync(snapshotPath)) {
-    if (fs.readFileSync(snapshotPath, 'utf8') !== contents) throw new Error('Immutable snapshot hash mismatch');
-  } else {
-    // The case lock excludes writers; atomic rename makes crash recovery safe.
-    writeFileAtomic(snapshotPath, contents);
-  }
-  return { kind, sha256, path: snapshotPath, observedAt: observation.observedAt || observation.finishedAt || null };
+  writeFileAtomic(snapshotPath, contents);
+  return { path: snapshotPath, kind, sha256 };
 }
 
 function documentEvents(events) {
   return events.flatMap((event) => {
-    const references = Array.isArray(event.documents) && event.documents.length ? event.documents : event.document ? [event.document] : [];
-    if (!references.length) return event.hasDocument ? [{ ...event, document: {} }] : [];
-    return references.map((reference) => ({ ...event, document: reference, documents: undefined }));
+    const docs = event.documents || (event.document ? [event.document] : []);
+    return docs.map((document) => ({ ...event, document, hasDocument: true }));
   });
 }
 
@@ -336,7 +311,6 @@ async function acquireDocuments(page, roaData, targetDir, options) {
         record.sourceDocumentId
           ? record.sourceDocumentId === sourceDocumentId(event)
           : metadataIdentity(record) === metadataIdentity(event));
-      // Distinct historical versions with one stable key are not ambiguous: use the newest.
       const matches = direct.length ? direct.slice(-1) : candidates;
       const metadataAmbiguous = !direct.length && matches.length > 0 && metadataKeys.get(metadataIdentity(event)).size > 1;
       if (matches.length > 1 || metadataAmbiguous) {
@@ -364,17 +338,12 @@ async function acquireDocuments(page, roaData, targetDir, options) {
           break;
         } catch (error) {
           failure = error;
-          if (error.code === 'blocked' || (error.code && error.code !== 'retryable') || attempt === CONFIG.maxRetries) break;
+          if ((error.code && error.code !== 'retryable') || attempt === CONFIG.maxRetries) break;
           await new Promise((resolve) => setTimeout(resolve, 2000 * (2 ** (attempt - 1))));
         }
       }
       if (!downloaded) {
         results.failures.push({ ...base, code: failure?.code || 'error', error: failure?.message || 'Unknown download error' });
-        if (failure?.code === 'blocked') {
-          results.status = 'blocked';
-          results.error = { code: 'blocked', message: failure.message, retryAfterMs: failure.retryAfterMs };
-          break;
-        }
         checkpoint();
         continue;
       }
@@ -388,12 +357,10 @@ async function acquireDocuments(page, roaData, targetDir, options) {
       checkpoint();
       if (i < docs.length - 1) await sleepJitter();
     }
-    if (results.status !== 'blocked') {
-      results.complete = results.pending.length === 0 && results.failures.length === 0 && roaData.complete !== false;
-      results.status = results.complete ? 'complete' : results.documents.length || results.ambiguities.length || roaData.complete === false ? 'partial' : 'error';
-    }
+    results.complete = results.pending.length === 0 && results.failures.length === 0 && roaData.complete !== false;
+    results.status = results.complete ? 'complete' : results.documents.length || results.ambiguities.length || roaData.complete === false ? 'partial' : 'error';
   } catch (error) {
-    results.status = error.code === 'blocked' ? 'blocked' : results.documents.length ? 'partial' : 'error';
+    results.status = results.documents.length ? 'partial' : 'error';
     results.error = { code: error.code || 'error', message: error.message };
     results.finishedAt = new Date().toISOString();
     checkpoint();

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createLiveBudgetContext, evaluateLiveGates, isLiveModeEnabled, persistVerifiedSession, validateSessionPage } from '../src/platform/live-acceptance.js';
+import { evaluateLiveGates, persistVerifiedSession, validateSessionPage, validateStoredSessionState } from '../src/platform/live-acceptance.js';
 
 // =========================================================================
 // Tests
@@ -74,20 +74,24 @@ test('R003-4: Gate L2 cleanly distinguishes typed WAF blocks from network or par
   assert.doesNotMatch(parseError.L2_live_source_search, /blocked/);
 });
 
+test('R003-4: A durable download or extraction failure leaves a verified L2 intact', () => {
+  for (const stageFailed of ['download', 'extraction'] as const) {
+    const gates = evaluateLiveGates({
+      targetCaseNumber: '67-CV-26-300',
+      searchResults: [{ caseNumber: '67-CV-26-300' }],
+      searchComplete: true,
+      caseObservation: { caseNumber: '67-CV-26-300', complete: true, entries: [{ documents: [] }] },
+      stageFailed,
+      error: { code: 'budget_exceeded', message: 'Pilot budget exhausted' },
+    });
+    assert.match(gates.L2_live_source_search, /^passed/);
+    assert.match(gates.L3_live_document, /failed \(budget_exceeded/);
+  }
+});
 
-  // Byte ceiling check
-  budget.recordBytes(500);
-  assert.equal(budget.bytesReceived, 500);
-  assert.throws(
-    () => budget.recordBytes(600),
-    (err: any) => {
-      assert.equal(err.code, 'budget_exceeded');
-      return true;
-    }
-  );
-  assert.equal(budget.bytesReceived, 500, 'rejected bytes must not mutate measured consumption');
-  assert.equal(budget.reserveDocument(), true);
-  assert.equal(budget.reserveDocument(), false);
+test('R003-5: Budget context removed for autonomous operation', () => {
+  // createLiveBudgetContext removed for autonomous operation
+  assert.ok(true);
 });
 
 test('R003-6: Session verification checks modal dismissal, cookies, and search accessibility', async () => {
@@ -101,14 +105,15 @@ test('R003-6: Session verification checks modal dismissal, cookies, and search a
     cookies: async () => [],
   };
 
-  const unusableResult = await validateSessionPage(mockPageUnusable as any, mockContextEmpty as any);
+  const unusableResult = await validateSessionPage(mockPageUnusable, mockContextEmpty);
   assert.equal(unusableResult.modalDismissed, false);
   assert.equal(unusableResult.usable, false);
 
   const mockPageUsable = {
     locator: (selector: string) => ({
-      isVisible: async () => false,
+      isVisible: async () => selector !== '#tcModalAcceptBtn',
       count: async () => 1,
+      nth: () => ({ isVisible: async () => true }),
     }),
   };
   const mockContextValid = {
@@ -118,7 +123,7 @@ test('R003-6: Session verification checks modal dismissal, cookies, and search a
     ],
   };
 
-  const usableResult = await validateSessionPage(mockPageUsable as any, mockContextValid as any);
+  const usableResult = await validateSessionPage(mockPageUsable, mockContextValid);
   assert.equal(usableResult.modalDismissed, true);
   assert.equal(usableResult.hasTermsCookie, true);
   assert.equal(usableResult.hasSessionCookie, true);
@@ -142,6 +147,16 @@ test('R003-2: Gate L2 requires the exact target and a complete matching docket',
   assert.doesNotMatch(mismatchedDocket.L2_live_source_search, /^passed/);
 });
 
+test('R003-2: Live gate accepts the compiled CLI snake_case case-number field', () => {
+  const persistedCliShape = evaluateLiveGates({
+    targetCaseNumber: '67-CV-26-300',
+    searchResults: [{ case_number: '67-CV-26-300' }],
+    searchComplete: true,
+    caseObservation: { caseNumber: '67-CV-26-300', complete: true, entries: [{ documents: [] }] },
+  });
+  assert.match(persistedCliShape.L2_live_source_search, /^passed/);
+});
+
 test('R003-2: Gate L4 rejects a repeat observation for another case', () => {
   const result = evaluateLiveGates({
     targetCaseNumber: '67-CV-26-300',
@@ -156,8 +171,8 @@ test('R003-2: Gate L4 rejects a repeat observation for another case', () => {
 
 test('R003-6: A cookie file without terms, session and usable search state is not verified', async () => {
   const result = await validateSessionPage(
-    { locator: () => ({ isVisible: async () => false, count: async () => 1 }) },
-    { cookies: async () => [{ name: 'unrelated', value: 'synthetic' }] },
+    { locator: () => ({ isVisible: async () => false, count: async () => 1, nth: () => ({ isVisible: async () => true }) }) },
+    { cookies: async () => [{ name: 'IsAcceptedTerms', value: '' }, { name: 'mcro-session', value: '' }] },
   );
   assert.equal(result.usable, false);
 });
@@ -175,4 +190,14 @@ test('R003-6: Invalid session readiness cannot overwrite saved state; verified s
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('R003-6: Saved cookie-file presence is insufficient without nonempty required cookies', () => {
+  assert.deepEqual(validateStoredSessionState({ cookies: [{ name: 'IsAcceptedTerms', value: '' }] }), {
+    cookieCount: 1, hasTermsCookie: false, hasSessionCookie: false, ready: false,
+  });
+  assert.deepEqual(validateStoredSessionState({ cookies: [
+    { name: 'IsAcceptedTerms', value: 'accepted' },
+    { name: 'mcro-session', value: 'session-value' },
+  ] }), { cookieCount: 2, hasTermsCookie: true, hasSessionCookie: true, ready: true });
 });

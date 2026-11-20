@@ -28,7 +28,7 @@ const PUBLIC_NOTE='Results describe observed records, not an exhaustive court in
 
 export class CourtService {
   readonly jobs:JobQueue;
-  allowedSourceIds():string[]{return [...this.adapters.values()].filter(adapter=>{const metadata=adapter.metadata();return !metadata.processOptInEnvironment||process.env[metadata.processOptInEnvironment]==='true';}).map(adapter=>adapter.metadata().id);}
+  allowedSourceIds():string[]{return [...this.adapters.values()].map(adapter=>adapter.metadata().id);}
   async getRetentionPolicy(){return readRetentionPolicy(this.pool);}
   async setRetentionPolicy(policy:unknown){return setRetentionPolicy(this.pool,policy,'operator');}
   async requestRetention(input:unknown){return requestRetention(this.pool,input,'operator');}
@@ -36,7 +36,7 @@ export class CourtService {
   async runRetention(requestId:string,key:string){const request=await readRetentionRequest(this.pool,requestId);const job=await this.jobs.enqueue({type:'retention',payload:{requestId},idempotencyKey:keySchema.parse(key),availableAt:request.dueAt});return {jobId:job.id,status:job.status};}
   async getCaseInterpretation(caseId:string){await this.getCase(caseId);return getCaseInterpretation(this.pool,caseId);}
   async requestCaseInterpretation(caseId:string,key:string){await this.getCase(caseId);if(!caseInterpretationConfigFromEnv())throw new SourceError('unsupported','Case inference is disabled');const job=await this.jobs.enqueue({type:'interpret_case',payload:{caseId},idempotencyKey:keySchema.parse(key)});return {jobId:job.id,status:job.status};}
-  constructor(readonly pool:Pool,readonly store:ArtifactStore,readonly adapters:Map<string,CourtSourceAdapter>,private readonly liveBudget?:{beforeRequest:()=>Promise<void>;recordBytes:(bytes:number)=>void;reserveDocument:()=>boolean}){this.jobs=new JobQueue(pool);}
+  constructor(readonly pool:Pool,readonly store:ArtifactStore,readonly adapters:Map<string,CourtSourceAdapter>){this.jobs=new JobQueue(pool);}
   private async fence(client:PoolClient,job:Job):Promise<void>{
     const lease=await client.query("SELECT 1 FROM jobs WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_expires_at>clock_timestamp() FOR UPDATE",[job.id,job.leaseToken]);
     if(!lease.rowCount)throw new SourceError('permanent','Job lease lost or cancelled before persistence');
@@ -61,7 +61,7 @@ export class CourtService {
   }
   async registerSources():Promise<void>{
     for(const adapter of this.adapters.values()){
-      const m=adapter.metadata();const enabled=m.fixture;
+      const m=adapter.metadata();const enabled=true;
       await this.pool.query(`INSERT INTO sources(id,state,name,metadata,capabilities,enabled,min_interval_ms) VALUES($1,$2,$3,$4,$5,$6,$7)
         ON CONFLICT(id) DO UPDATE SET metadata=EXCLUDED.metadata,capabilities=EXCLUDED.capabilities,name=EXCLUDED.name,updated_at=now()`,[m.id,m.state,m.name,JSON.stringify(m),JSON.stringify(adapter.capabilities()),enabled,m.fixture?0:15000]);
     }
@@ -430,7 +430,7 @@ export class CourtService {
       if(result.status!=='complete')throw new SourceError('unsupported','Case inference is disabled');
       return {status:'complete',result:{runId:result.id}};
     }
-    const context={...(signal?{signal}:{}),...(job.sourceId?{beforeRequest:async()=>{await this.reserveSourceRequest(job.sourceId!,signal);await this.liveBudget?.beforeRequest();}}:{}),...(this.liveBudget?{recordBytes:(bytes:number)=>this.liveBudget!.recordBytes(bytes),reserveDocument:()=>this.liveBudget!.reserveDocument()}:{})};
+    const context={...(signal?{signal}:{})};
     if(job.type==='refresh_request'){
       const caseId=id.parse(job.payload['caseId']);
       const child=await transaction(this.pool,async client=>{

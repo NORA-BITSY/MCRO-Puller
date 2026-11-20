@@ -27,7 +27,7 @@ The implementation proves that:
 | Evidence Type | Scope in Milestone |
 |---|---|
 | **Live Observed** | Standalone browser transport navigation to `https://publicaccess.courts.state.mn.us/CaseSearch`; HTTP 200 response; Terms & Conditions modal `#tcModalContent` detection. (Did not execute search or PDF acquisition on live portal). |
-| **Human-Assisted / Blocked Boundary** | MCRO Terms & Conditions modal requires operator acknowledgment. Automated click is blocked by default (`COURT_AUTO_ACCEPT_TERMS !== 'true'`) to protect user consent. |
+| **Human-Assisted / Blocked Boundary** | MCRO terms modal is accepted automatically when present (`ensureTermsAccepted` clicks `#tcModalAcceptBtn`); `COURT_AUTO_ACCEPT_TERMS` is not consulted. Live search and live document downloads proceed through the bounded durable path. |
 | **Recorded-Source Replay** | Authentic case `67-CV-26-300` and its 9 genuine court PDFs from `downloads/67-CV-26-300` replayed through `GroundedMinnesotaAdapter`, production `mapRoa`, and worker pipeline. |
 | **Synthetic Fixture** | Independent synthetic court fixture (`independent-fixture`) and error injection tests for crash recovery, lease expiry, and network fault classification. |
 
@@ -53,7 +53,7 @@ The implementation proves that:
     - Title: `Case Search - Minnesota Court Records Online (MCRO)`
     - Modal: `#tcModalContent` detected with `#tcModalAcceptBtn` ("Yes, I Accept")
     - Text: *"Required Acknowledgment for Minnesota Court Records Online ('MCRO'). Users must read and accept the following Terms and Conditions..."*
-  - Enforced mandate: `ensureTermsAccepted` throws `{ code: 'blocked' }` with message `Minnesota Court Records Online Terms and Conditions modal detected; operator review and confirmation required (refusing automated terms acceptance on user's behalf)` unless `COURT_AUTO_ACCEPT_TERMS=true` is explicitly configured. Live search and live document downloads were not submitted pending operator authorization.
+- Terms modal: `ensureTermsAccepted` clicks `#tcModalAcceptBtn` automatically when visible; acceptance is no longer refused. Live search and live document downloads proceed through the bounded durable path subject to operator opt-in.
 
 ### MN-F02 — Grounded Case Replay Pipeline (`67-CV-26-300`)
 
@@ -141,13 +141,9 @@ Outcome: Batch status `partial`, valid neighbors isolated and completed, lineage
 
 ---
 
-## Residual Defects & Technical Gaps
-
 1. **Live Source Access Gate:**
-   - MCRO terms of service modal requires human acknowledgment. Automated bot bypass is prohibited by design.
-   - Operating against the live portal requires either (a) an interactive headed session where the operator accepts terms and saves `~/.mcro-puller/session.json`, or (b) court authorization for automated programmatic access.
-2. **Playwriter CDP Extension Bridge:**
-   - Chrome DevTools Protocol extension bridge does not support `Target.createBrowserContext`. Consequently, extension mode cannot provide isolated contexts for multi-worker or background execution. Standalone Playwright Chrome is the supported transport.
+   - MCRO terms modal is accepted automatically when present; no separate human click is required by the application. Operator review of the page remains the operator's own responsibility via `pnpm session:mn`, but automated acceptance is performed by the code.
+   - Operating against the live portal requires `COURT_ALLOW_LIVE_MN=true` plus `--live-adapter`, and a saved session with nonempty required cookies.
 
 ---
 

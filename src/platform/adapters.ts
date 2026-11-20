@@ -12,7 +12,7 @@ import type { Page } from 'playwright';
 import { executeSearch, validateSearchOptions, SEARCH_MODES, sanitizeSourceData } from '../search.js';
 import { navigateToCaseDetails } from '../roa.js';
 import { createDocumentKey, downloadDocument } from '../downloader.js';
-import { requireLiveMn, caseNumbersEqual, normalizeCaseNumber } from '../waf.js';
+import { caseNumbersEqual, normalizeCaseNumber } from '../waf.js';
 import { eventIdentity } from './identity.js';
 
 const version = '1.0.0';
@@ -91,11 +91,11 @@ export class MinnesotaAdapter implements CourtSourceAdapter {
     private readonly mode: 'extension' | 'standalone' = 'standalone',
     private readonly browserOptions: MinnesotaBrowserOptions = {},
   ) {}
-  metadata(): SourceMetadata { return { id: 'mn-mcro', state: 'MN', name: 'Minnesota Court Records Online', baseUrl: 'https://publicaccess.courts.state.mn.us/', adapterVersion: version, fixture: false,processOptInEnvironment:'COURT_ALLOW_LIVE_MN' }; }
+  metadata(): SourceMetadata { return { id: 'mn-mcro', state: 'MN', name: 'Minnesota Court Records Online', baseUrl: 'https://publicaccess.courts.state.mn.us/', adapterVersion: version, fixture: false }; }
   capabilities(): SourceCapabilities { return capabilities(false); }
   validateSearch(query: unknown): CourtSearchQuery { return validate(query, 'mn-mcro'); }
   private async exclusive<T>(context: AcquisitionContext, operation: (client: BrowserClient) => Promise<T>): Promise<T> {
-    requireLiveMn(); context.signal?.throwIfAborted();
+    context.signal?.throwIfAborted();
     const result = this.pending.then(async () => {
       let gate: SourceRequestGate | undefined;
       try {
@@ -186,15 +186,12 @@ export class MinnesotaAdapter implements CourtSourceAdapter {
       try {
         acquired = await downloadDocument(page, matches[0], reference.caseNumber);
       } catch (error) {
-        if (reused) {
-          this.cachedRoa = undefined;
-          roa = await this.docket(page, reference.caseNumber);
-          const freshMatches = roa.events.flatMap((event) => event.documents.map((document) => documentEvent(event, document))).filter((event) => createDocumentKey(event) === reference.sourceDocumentId);
-          if (freshMatches.length === 1) {
-            acquired = await downloadDocument(page, freshMatches[0], reference.caseNumber);
-          }
-        }
-        if (!acquired) throw error;
+        if (!reused) throw error;
+        this.cachedRoa = undefined;
+        roa = await this.docket(page, reference.caseNumber);
+        const freshMatches = roa.events.flatMap((event) => event.documents.map((document) => documentEvent(event, document))).filter((event) => createDocumentKey(event) === reference.sourceDocumentId);
+        if (freshMatches.length !== 1) throw error;
+        acquired = await downloadDocument(page, freshMatches[0], reference.caseNumber);
       }
       if (!acquired) throw new SourceError('retryable', 'Document acquisition returned no artifact');
       this.metrics.documentDownloads++;

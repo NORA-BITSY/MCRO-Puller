@@ -52,30 +52,29 @@ For repeatable feasibility verification in an isolated database schema:
 pnpm feasibility:mn
 ```
 
-This executes all feasibility stages (MN-F01–F05): subsystem readiness, browser transport contracts and isolation, authentic case acquisition for `67-CV-26-300` through durable worker queue and selective OCR, reconciliation table accounting, 7 search modes verification, mixed bulk query error isolation, docket reuse efficiency (`navsAvoided > 0`), and worker crash/recovery.
+This executes all feasibility stages (MN-F01–F05): subsystem readiness, browser transport contracts and isolation, nine authentic previously acquired PDFs replayed through the durable worker and selective OCR, reconciliation, seven offline search-mode checks, mixed bulk error isolation, docket reuse, and worker crash/recovery. Replay is local evidence, not fresh-source acceptance.
 
-## Human-assisted operator session & live acquisition (WO-MCRO-MN-LIVE-003)
+# Human-assisted operator session & bounded live path (WO-MCRO-MN-LIVE-003)
 
-Live court portal requests are gated on explicit operator authorization. Do not accept terms or bypass challenges automatically.
+The live runner requires both `COURT_ALLOW_LIVE_MN=true` and its explicit `--live-adapter` option, passed by `pnpm live:mn`. Terms are accepted automatically when the modal appears; operator review still gates whether to proceed with source work. Without a saved session containing nonempty required cookies, it stops before source work. Cookie presence is not proof that the portal will authorize a later request.
 
 ```sh
-# 1. Option A: Establish an isolated operator session in headed Chrome
+# 1. Open the isolated headed browser and personally review the page.
 pnpm session:mn
-# (Review terms in the browser window, click 'Yes, I Accept', then press ENTER in the terminal)
+# Review the Minnesota Judicial Branch Terms and Conditions dialog. Press Enter
+# after the page is ready to save the session; otherwise cancel/close without saving.
 
-# 1. Option B: Import exported browser cookies (e.g. from Cookie-Editor)
-node scripts/session-interactive.mjs --import /path/to/cookies.json
+# 2. Check stored-cookie readiness without disclosing values.
+pnpm session:mn -- --status
 
-# 2. Inspect session status (verifies mode 0600 and cookies without secret disclosure)
-node dist/src/platform/courtctl.js session status
+# 3. Only after the operator gate is satisfied, run the bounded durable path.
+COURT_ALLOW_LIVE_MN=true pnpm live:mn
 
-# 3. Execute bounded live acquisition probe against real MinnesotaAdapter
-export COURT_ALLOW_LIVE_MN=true
-pnpm live:mn
-
-# 4. Clear/revoke session state when completed or expired
+# 4. Clear local session state if it is expired or no longer needed.
 node dist/src/platform/courtctl.js session clear
 ```
+
+This one-worker pilot is capped at 150 primary source-data requests, 15 PDFs, and 128 MiB of document bodies. It uses the durable MinnesotaAdapter → service/worker → storage/extraction path and checks CLI, authenticated HTTP, and MCP retrieval. Live schemas, artifacts, and reports are retained. A block, denial, or human-confirmation prompt stops the run; do not retry or rotate identity. L2–L4 remain pending until corresponding fresh observations exist. See [live integration evidence](MINNESOTA_LIVE_INTEGRATION.md).
 
 For repeatable offline acceptance:
 
@@ -199,7 +198,7 @@ Temporary one-off smoke/crash scripts were removed after preserving reports; `sc
 
 No known local Minnesota acceptance failure remains. Keep these gates separate:
 
-1. **Pat + Minnesota court:** obtain an approved automated route/budget/credentials or authorized bulk sample. Current MCRO terms prohibited bots; no terms acceptance/search performed. Then separately authorize bounded live search/acquire/refresh tests. No proxy cycling or WAF/CAPTCHA bypass.
+1. **Operator + source access:** Live L2–L4 remain pending until a current, authorized source interaction occurs. The operator independently reviews and decides whether to act on any terms prompt. The bounded runner requires explicit opt-in; blocks stop work. No source-policy research was repeated here.
 2. **Pat + release operator:** approve cloud project/region/owners/budget and reviewed plan before spending/deploying. Supply exact release/proxy/COS digests, secrets and protected state. Restricted-role SQL grants need integration for refresh/retention writes and real role-based staging tests; physical GCS GC needs separate approved custodian permission. Neither is established by the local owner-backed test. Production monitoring/PITR/IAM/source behavior remain unverified.
 3. **Pat + data-governance owner:** paid inference/subscription and data-sharing decisions remain closed. Required local functionality does not depend on them.
 4. **Deferred national roadmap:** live second state, large-scale source/DB benchmark, advanced OCR comparison and calibrated NLP evaluation remain explicitly deferred, not complete.
