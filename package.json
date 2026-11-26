@@ -25,6 +25,7 @@
     "api": "tsx src/platform/api.ts",
     "mcp": "tsx src/platform/mcp.ts",
     "worker": "tsx src/platform/worker.ts",
+    "worker:aggressive": "tsx src/platform/aggressive-worker-entry.ts",
     "dev:database": "tsx scripts/dev-database.ts",
     "decodo:mn": "node scripts/decodo-provision.mjs",
     "decodo:check": "node scripts/decodo-provision.mjs --check"
@@ -55,6 +56,8 @@
     "fastify": "^5.12.8",
     "pg": "^8.23.1",
     "playwright": "^1.65.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "playwriter": "^0.11.0",
     "zod": "^4.6.7"
   },

@@ -20,12 +20,14 @@ const hash = (value: unknown): string => createHash('sha256').update(JSON.string
 const now = (): string => new Date().toISOString();
 const record = z.record(z.string(), z.unknown());
 function sanitized(value: unknown): Record<string, unknown> { return record.parse(sanitizeSourceData(value)); }
+export function sanitizeSourceDataAdapter(value: unknown): Record<string, unknown> { return sanitized(value); }
 function validate(input: unknown, sourceId: string): CourtSearchQuery {
   const parsed = CourtSearchQuerySchema.parse(input);
   if (parsed.sourceId !== sourceId) throw new SourceError('permanent', `Expected sourceId ${sourceId}`);
   try { validateSearchOptions(parsed); } catch (error) { throw new SourceError('permanent', error instanceof Error ? error.message : String(error), { cause: error }); }
   return parsed;
 }
+export function validateAdapter(input: unknown, sourceId: string): CourtSearchQuery { return validate(input, sourceId); }
 function capabilities(fixture: boolean): SourceCapabilities {
   return {
     searchModes: Object.fromEntries(Object.entries(SEARCH_MODES).map(([mode, shape]) => [mode, { required: shape.required, optional: shape.optional, verified: fixture ? 'fixture' : 'documented', limitations: fixture ? ['Synthetic records only; not a second real jurisdiction.'] : ['Documented in Minnesota SCAO 2022-08-05 guides; current live execution has not been verified.', ...(mode === 'party' || mode === 'business' || mode === 'hearing' ? ['Name searches omit pending criminal matters; absent results do not establish absence of a case.'] : [])] }])),
@@ -39,7 +41,8 @@ const legacyCase = z.object({ caseNumber: z.string(), caseTitle: z.string().defa
 const legacyDocument = z.object({ sourceDocumentId: z.string().optional(), pages: z.string().default(''), title: z.string().optional(), downloadToken: z.string().default(''), requestVerificationToken: z.string().default(''), formAction: z.string().optional(), formIndex: z.number().optional() }).passthrough();
 const legacyEvent = z.object({ index: z.number(), sourceId: z.string().optional(), date: z.string(), description: z.string(), indexText: z.string(), documents: z.array(legacyDocument) }).passthrough();
 const legacyRoa = z.object({ caseInfo: legacyCase, parties: z.array(z.string()), events: z.array(legacyEvent), sections: z.array(record), rawText: z.string() }).passthrough();
-type LegacyRoa = z.infer<typeof legacyRoa>;
+export type LegacyRoa = z.infer<typeof legacyRoa>;
+export { legacyCase, legacyDocument, legacyEvent, legacyRoa };
 function candidate(value: z.infer<typeof legacyCase>): CaseCandidate {
   return { sourceCaseId: value.caseNumber, caseNumber: value.caseNumber, title: value.caseTitle, court: value.caseLocation, status: value.caseStatus, raw: sanitized(value) };
 }

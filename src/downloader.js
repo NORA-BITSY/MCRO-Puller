@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { runNativeSync } from './native-tools.js';
 import { CONFIG } from './config.js';
 import { caseNumbersEqual, normalizeCaseNumber, sleepJitter } from './waf.js';
+export { caseNumbersEqual, normalizeCaseNumber, sleepJitter } from './waf.js';
 import { withCaseLock } from './state.js';
 
 function sourceError(code, message, options = {}) {
