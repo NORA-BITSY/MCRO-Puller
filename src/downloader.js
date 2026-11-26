@@ -91,6 +91,7 @@ function sanitizeObservation(value) {
     for (const secret of secrets) text = text.split(secret).join('[REDACTED]');
     return text;
   }
+  return clean(value);
 }
 function metadataIdentity(event) {
   return JSON.stringify([event.indexText, event.date, event.description || event.title,
