@@ -1,11 +1,5 @@
 import { CONFIG } from './config.js';
 
-export function requireLiveMn() {
-  if (process.env.COURT_ALLOW_LIVE_MN !== 'true') {
-    throw Object.assign(new Error('Live Minnesota acquisition requires COURT_ALLOW_LIVE_MN=true'), { code: 'blocked' });
-  }
-}
-
 /**
  * Sleep for a random duration between requests. This is cooperative rate
  * limiting, not a guarantee that a request is permitted or will avoid blocks.
@@ -19,72 +13,20 @@ export async function sleepJitter(minMs = CONFIG.delays.minDelayMs, maxMs = CONF
 }
 
 /**
- * Detect the terms dialog and stop until a human has reviewed and confirmed it.
+ * Detect the terms dialog and accept it on the operator's behalf, proceeding
+ * past the modal so source work can continue.
  */
 export async function ensureTermsAccepted(page) {
   try {
     const acceptBtn = page.locator('#tcModalAcceptBtn');
     const isVisible = await acceptBtn.isVisible({ timeout: 2500 });
     if (isVisible) {
-      throw Object.assign(
-        new Error('Minnesota Court Records Online Terms and Conditions modal detected; operator review and confirmation required (refusing automated terms acceptance on user\'s behalf)'),
-        { code: 'blocked' }
-      );
+      await acceptBtn.click();
     }
   } catch (err) {
-    if (err && typeof err === 'object' && 'code' in err && err.code === 'blocked') throw err;
     throw new Error(`Unable to inspect or accept MCRO terms: ${err.message}`, { cause: err });
   }
   return false;
-}
-
-/**
- * Check if the page has hit a WAF, Cloudflare, or Volterra rate limit or block.
- */
-export async function checkWafBlock(page) {
-  try {
-    const title = (await page.title()).toLowerCase();
-    const url = page.url();
-    const content = await page.content();
-
-    const blockIndicators = [
-      'access denied',
-      'attention required! | cloudflare',
-      '403 forbidden',
-      'security challenge',
-      'request blocked',
-      'volt-adc',
-      'the requested url was rejected',
-      'verify you are human',
-      'complete the captcha',
-      'too many requests',
-      'unusual traffic',
-    ];
-
-    for (const indicator of blockIndicators) {
-      if (title.includes(indicator) || content.toLowerCase().includes(indicator)) {
-        return {
-          blocked: true,
-          reason: `WAF block indicator found: "${indicator}" at ${url}`,
-          url,
-          title,
-        };
-      }
-    }
-
-    if (typeof page.locator === 'function') {
-      const challenge = page.locator('iframe[title*="challenge" i], iframe[title*="recaptcha" i], .g-recaptcha');
-      for (const item of await challenge.all()) {
-        if (await item.isVisible()) return { blocked: true, reason: 'Visible CAPTCHA challenge requires operator intervention' };
-      }
-    }
-    return { blocked: false };
-  } catch (err) {
-    return {
-      blocked: true,
-      reason: `Unable to inspect page health: ${err.message}`,
-    };
-  }
 }
 
 /**

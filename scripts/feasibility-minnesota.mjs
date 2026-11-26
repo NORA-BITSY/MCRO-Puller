@@ -20,7 +20,7 @@ import { MinnesotaAdapter, mapRoa } from '../dist/src/platform/adapters.js';
 import { findSystemChrome } from '../dist/src/browser.js';
 import { chromium } from 'playwright';
 import { CONFIG } from '../dist/src/config.js';
-import { createLiveBudgetContext, evaluateLiveGates, isLiveModeEnabled } from '../src/platform/live-acceptance.js';
+import { createLiveBudgetContext, evaluateLiveGates, isLiveModeEnabled, validateStoredSessionState } from '../src/platform/live-acceptance.js';
 import { caseNumbersEqual } from '../src/waf.js';
 
 const exec = promisify(execFile);
@@ -366,7 +366,6 @@ if (!process.argv.includes('--crash-worker')) {
       acceptDownloads: true,
     });
     let liveStatus = isLive ? 'pending durable MinnesotaAdapter worker execution' : 'offline_default';
-    const tcModalObserved = false;
     const sessionFile = process.env.COURT_SESSION_FILE || CONFIG.sessionFile || path.join(os.homedir(), '.mcro-puller', 'session.json');
     const courtProxies = (process.env.COURT_PROXIES || '').split(',').map((entry) => entry.trim()).filter(Boolean);
     const proxy = process.env.COURT_PROXY || courtProxies[0];
@@ -375,17 +374,30 @@ if (!process.argv.includes('--crash-worker')) {
       maxBytes: 128 * 1024 * 1024,
       maxDocuments: 15,
     }) : undefined;
-    let liveGates = {
-      L1_local: 'not evaluated in this run',
+    let liveGates = isLive ? {
+      L1_local: 'not evaluated in this live run',
       L2_live_source_search: 'pending_operator_gate',
       L3_live_document: 'pending_operator_gate',
       L4_repeatability: 'pending_operator_gate',
+    } : {
+      L1_local: 'offline acceptance in progress',
+      L2_live_source_search: 'not evaluated (offline replay)',
+      L3_live_document: 'not evaluated (offline replay)',
+      L4_repeatability: 'not evaluated (offline replay)',
     };
+    if (isLive) {
       metrics.environment.sessionFilePresent = existsSync(sessionFile);
       metrics.environment.proxyConfigured = Boolean(proxy);
       metrics.liveExperiment.sessionFilePresent = existsSync(sessionFile);
+      if (!existsSync(sessionFile)) throw new Error('No saved Minnesota browser session. Run pnpm session:mn and complete any terms action yourself before live acquisition.');
+      let savedSessionState;
+      try { savedSessionState = JSON.parse(readFileSync(sessionFile, 'utf8')); }
+      catch { throw new Error('Saved Minnesota browser session is unreadable; no live request was made.'); }
+      const sessionReadiness = validateStoredSessionState(savedSessionState);
+      metrics.liveExperiment.sessionCookiesReady = sessionReadiness.ready;
+      if (!sessionReadiness.ready) throw new Error('Saved session lacks nonempty Minnesota terms and session cookies; rerun pnpm session:mn before live acquisition.');
       console.log('  [Live Mode Active] Source traffic will run only through the durable MinnesotaAdapter service/worker path.');
-      console.log(`  - Saved session file: ${existsSync(sessionFile) ? 'present (previously verified by interactive session flow)' : 'absent'}`);
+      console.log('  - Saved session cookie state: present; live page readiness will be determined by the durable search job');
       console.log(`  - Request/PDF/body ceilings: 150 requests / 15 PDFs / 128 MiB`);
     } else {
       console.log('  [Offline Replay Mode] Preserving network-free replay default (no portal navigation).');
@@ -439,22 +451,39 @@ if (!process.argv.includes('--crash-worker')) {
     console.log(`  - Worker completed ${completedInitial} durable tasks`);
 
     const dbCases = await cli('db', 'search', '--state', 'MN');
-    const caseRecord = dbCases.data.find((candidate) => caseNumbersEqual(candidate.caseNumber, caseNumber));
+    const caseRow = dbCases.data.find((candidate) => caseNumbersEqual(candidate.caseNumber ?? candidate.case_number, caseNumber));
+    const caseRecord = caseRow ? { ...caseRow, caseNumber: caseRow.caseNumber ?? caseRow.case_number } : undefined;
     const searchJob = (await pool.query('SELECT status,error FROM jobs WHERE id=$1', [acquireJob.jobId])).rows[0];
     const searchCoverage = (await pool.query("SELECT status FROM coverage_observations WHERE job_id=$1 AND dimension='discovery'", [acquireJob.jobId])).rows[0];
+    const workflowFailures = await pool.query(`WITH RECURSIVE descendants(id) AS (
+      SELECT child_id FROM job_links WHERE parent_id=$1
+      UNION SELECT links.child_id FROM job_links links JOIN descendants d ON links.parent_id=d.id
+    )
+    SELECT j.type,j.status,j.error FROM jobs j JOIN descendants d ON d.id=j.id
+    WHERE j.status IN ('blocked','dead_letter') AND j.error IS NOT NULL ORDER BY j.created_at,j.id`, [acquireJob.jobId]);
+    const artifactFailures = workflowFailures.rows.filter((row) => ['download_artifact', 'process_document'].includes(row.type));
+    if (isLive) metrics.liveSearch = { jobId: acquireJob.jobId, status: searchJob?.status ?? 'missing',
+      coverage: searchCoverage?.status ?? 'missing', casesObserved: dbCases.data.length,
+      workflowFailures: artifactFailures.map(({ type, status, error }) => ({
+        type, status, code: error?.originalCode || error?.code || 'unclassified',
+      })) };
     if (!caseRecord) {
-      liveGates = evaluateLiveGates({
-        targetCaseNumber: caseNumber,
-        searchResults: dbCases.data,
-        searchComplete: searchCoverage?.status === 'observed',
-        ...(searchJob?.status === 'complete' || searchJob?.status === 'partial' ? {} : {
-          stageFailed: 'search',
-          error: searchJob?.error || { code: 'retryable', message: 'Durable source-search job did not complete' },
-        }),
-      });
-      metrics.gates = liveGates;
-      metrics.liveSearch = { jobId: acquireJob.jobId, status: searchJob?.status ?? 'missing', coverage: searchCoverage?.status ?? 'missing', casesObserved: dbCases.data.length };
-      assert.ok(caseRecord, `No selected case was observed through the durable source-search job; L2=${liveGates.L2_live_source_search}. No replay fallback is permitted.`);
+      if (isLive) {
+        liveGates = evaluateLiveGates({
+          targetCaseNumber: caseNumber,
+          searchResults: dbCases.data,
+          searchComplete: searchCoverage?.status === 'observed',
+          ...(searchJob?.status === 'complete' || searchJob?.status === 'partial' ? {} : {
+            stageFailed: 'search',
+            error: searchJob?.error || { code: 'retryable', message: 'Durable source-search job did not complete' },
+          }),
+        });
+        metrics.gates = liveGates;
+        metrics.liveSearch = { jobId: acquireJob.jobId, status: searchJob?.status ?? 'missing', coverage: searchCoverage?.status ?? 'missing', casesObserved: dbCases.data.length };
+      }
+      assert.ok(caseRecord, isLive
+        ? `No selected case was observed through the durable source-search job; L2=${liveGates.L2_live_source_search}. No replay fallback is permitted.`
+        : 'The offline replay did not produce the selected case record.');
     }
     const caseId = caseRecord.id;
     const docketResult = await cli('case', 'docket', caseId);
@@ -475,26 +504,35 @@ if (!process.argv.includes('--crash-worker')) {
     const acquiredDocumentIds = new Set((await pool.query('SELECT id FROM documents WHERE case_id=$1 AND current_version_id IS NOT NULL ORDER BY id', [caseId])).rows.map((row) => row.id));
     const sampleDoc = documents.find((document) => acquiredDocumentIds.has(document.id));
     if (isLive && !sampleDoc) {
+      const failedArtifactJob = artifactFailures.find((row) => row.type === 'download_artifact' || row.type === 'process_document');
+      const failureDetails = failedArtifactJob?.error || {};
+      liveGates = evaluateLiveGates({
+        targetCaseNumber: caseNumber,
+        searchResults: dbCases.data,
+        searchComplete,
+        caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
+        ...(failedArtifactJob ? {
+          stageFailed: failedArtifactJob.type === 'process_document' ? 'extraction' : 'download',
+          error: {
+            code: failureDetails.originalCode || failureDetails.code || (failedArtifactJob.status === 'blocked' ? 'blocked' : 'permanent'),
+            message: failureDetails.message || `${failedArtifactJob.type} ${failedArtifactJob.status}`,
+          },
+        } : {}),
+      });
+      metrics.gates = liveGates;
+    }
+    assert.ok(sampleDoc, 'The selected case must have an acquired document for text/API/MCP verification');
+    const artifactEvidence = (await pool.query(`SELECT dv.filename,a.size_bytes::int AS bytes,a.sha256,
+      EXISTS(SELECT 1 FROM extraction_runs er WHERE er.document_version_id=dv.id AND er.status IN ('complete','partial')) AS extracted
+      FROM documents d JOIN document_versions dv ON dv.id=d.current_version_id JOIN artifacts a ON a.id=dv.artifact_id WHERE d.id=$1`, [sampleDoc.id])).rows[0];
+    if (isLive) {
       liveGates = evaluateLiveGates({
         targetCaseNumber: caseNumber,
         searchResults: dbCases.data,
         searchComplete,
         caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
       });
-      metrics.gates = liveGates;
-      assert.ok(sampleDoc, `No acquired public document is available through the durable pipeline; L3=${liveGates.L3_live_document}. No replay fallback is permitted.`);
     }
-    assert.ok(sampleDoc, 'The selected case must have an acquired document for text/API/MCP verification');
-    const artifactEvidence = (await pool.query(`SELECT dv.filename,a.size_bytes::int AS bytes,a.sha256,
-      EXISTS(SELECT 1 FROM extraction_runs er WHERE er.document_version_id=dv.id AND er.status IN ('complete','partial')) AS extracted
-      FROM documents d JOIN document_versions dv ON dv.id=d.current_version_id JOIN artifacts a ON a.id=dv.artifact_id WHERE d.id=$1`, [sampleDoc.id])).rows[0];
-    liveGates = evaluateLiveGates({
-      targetCaseNumber: caseNumber,
-      searchResults: dbCases.data,
-      searchComplete,
-      caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
-    });
-
     const reconciliationTable = {
       caseNumber: caseRecord.caseNumber,
       sourceEventsObserved: docketEntries.length,
@@ -571,14 +609,16 @@ if (!process.argv.includes('--crash-worker')) {
     assert.ok(!mcpText.isError, 'MCP get_document_text must succeed');
     const mcpTextData = JSON.parse(mcpText.content[0].text);
     assert.ok(mcpTextData.data.length > 0);
-    liveGates = evaluateLiveGates({
-      targetCaseNumber: caseNumber,
-      searchResults: dbCases.data,
-      searchComplete,
-      caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
-      documentObservation: isLive && artifactEvidence ? { ...artifactEvidence, persisted: storageCheck.failures.length === 0 } : undefined,
-    });
-    metrics.gates = liveGates;
+    if (isLive) {
+      liveGates = evaluateLiveGates({
+        targetCaseNumber: caseNumber,
+        searchResults: dbCases.data,
+        searchComplete,
+        caseObservation: { caseNumber: caseRecord.caseNumber, complete: latestSnapshot?.complete === true, entries: docketEntries },
+        documentObservation: artifactEvidence ? { ...artifactEvidence, persisted: storageCheck.failures.length === 0 } : undefined,
+      });
+      metrics.gates = liveGates;
+    }
 
     // -----------------------------------------------------------
     if (!isLive) {
@@ -721,6 +761,9 @@ if (!process.argv.includes('--crash-worker')) {
           comparison: snapshots[0]?.sha256 === snapshots[1]?.sha256 ? 'no_change' : 'changed',
         } : 'not_observed',
       };
+    } else {
+      liveGates.L1_local = 'passed (offline replay, durable worker, CLI/HTTP/MCP, refresh, and recovery)';
+      metrics.gates = liveGates;
     }
 
     // -----------------------------------------------------------
@@ -751,7 +794,7 @@ if (!process.argv.includes('--crash-worker')) {
   } catch (error) {
     metrics.failure = {
       code: error && typeof error === 'object' && typeof error.code === 'string' ? error.code : 'unclassified',
-      message: error instanceof Error ? error.message.replace(/([?&](?:token|key|signature|session)=)[^&\\s]+/gi, '$1[redacted]') : 'Unclassified feasibility failure',
+      message: error instanceof Error ? error.message.replace(/([?&](?:token|key|signature|session)=)[^&\s]+/gi, '$1[redacted]') : 'Unclassified feasibility failure',
     };
     throw error;
   } finally {

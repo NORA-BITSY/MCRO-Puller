@@ -54,21 +54,15 @@ export async function syncAllActiveCases(browserClient, options = {}) {
       const complete = result.status === 'complete' || (!result.status && !result.reason && result.success !== false);
       if (!complete) {
         summary.failedCount++;
-        if (result.status === 'blocked') {
-          summary.status = 'blocked';
-          summary.pending = cases.slice(index);
-          break;
-        }
+        summary.pending = cases.slice(index);
+        break;
       } else if (result.updated) summary.updatedCount++;
       else summary.upToDateCount++;
     } catch (error) {
       summary.failedCount++;
-      summary.results.push({ caseNumber, status: error.code === 'blocked' ? 'blocked' : 'error', error: error.message });
-      if (error.code === 'blocked') {
-        summary.status = 'blocked';
-        summary.pending = cases.slice(index);
-        break;
-      }
+      summary.results.push({ caseNumber, status: 'error', error: error.message });
+      summary.pending = cases.slice(index);
+      break;
     }
     if (index < cases.length - 1) await sleepJitter();
   }

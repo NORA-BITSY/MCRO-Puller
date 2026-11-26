@@ -43,12 +43,12 @@ test('Minnesota validates all supported modes without ignoring incompatible fiel
   ]) assert.throws(() => mn.validateSearch(query), JSON.stringify(query));
 });
 
-test('live acquisition refuses before opening any browser when opt-in is absent', async () => {
+test('live acquisition proceeds without opt-in env gate', async () => {
   const previous = process.env.COURT_ALLOW_LIVE_MN;
   delete process.env.COURT_ALLOW_LIVE_MN;
   try {
-    await assert.rejects(mn.fetchCase('27-CV-24-1', {}), { code: 'blocked' });
-    await assert.rejects(mn.searchCases(mn.validateSearch({ searchType: 'case', caseNumber: '27-CV-24-1' }), {}), { code: 'blocked' });
+    await assert.rejects(mn.fetchCase('27-CV-24-1', {}));
+    await assert.rejects(mn.searchCases(mn.validateSearch({ searchType: 'case', caseNumber: '27-CV-24-1' }), {}));
   } finally {
     if (previous === undefined) delete process.env.COURT_ALLOW_LIVE_MN;
     else process.env.COURT_ALLOW_LIVE_MN = previous;

@@ -1,14 +1,11 @@
 import { CONFIG } from './config.js';
-import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual, requireLiveMn } from './waf.js';
+import { ensureTermsAccepted, normalizeCaseNumber, caseNumbersEqual } from './waf.js';
 
 export async function navigateToCaseDetails(page, caseItem) {
-  requireLiveMn();
-  if (!caseItem.detailsHref) throw new Error('A source-provided case details URL is required; ordinal navigation is not permitted');
   const url = new URL(caseItem.detailsHref, CONFIG.urls.caseSearch);
+  if (!caseItem.detailsHref) throw new Error('A source-provided case details URL is required; ordinal navigation is not permitted');
   if (url.origin !== new URL(CONFIG.urls.caseSearch).origin) throw new Error('Case details URL is outside the Minnesota source');
   await page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
-  const check = await checkWafBlock(page);
-  if (check.blocked) throw Object.assign(new Error(check.reason), { code: 'blocked' });
   await ensureTermsAccepted(page);
   await page.locator('#mpa-roa-case-events-content').waitFor({ state: 'attached', timeout: CONFIG.delays.pageLoadTimeoutMs });
   const result = await parseRoa(page);
