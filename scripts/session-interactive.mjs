@@ -5,7 +5,7 @@ import os from 'node:os';
 import readline from 'node:readline';
 import { findSystemChrome } from '../dist/src/browser.js';
 import { CONFIG } from '../dist/src/config.js';
-import { persistVerifiedSession, validateSessionPage } from '../src/platform/live-acceptance.js';
+import { persistVerifiedSession, validateSessionPage, validateStoredSessionState } from '../src/platform/live-acceptance.js';
 
 const sessionPath = process.env.COURT_SESSION_FILE || CONFIG.sessionFile || path.join(os.homedir(), '.mcro-puller', 'session.json');
 
@@ -18,6 +18,7 @@ export function getSessionStatus(targetPath = sessionPath) {
     const modeOctal = (stat.mode & 0o777).toString(8).padStart(4, '0');
     const content = JSON.parse(readFileSync(targetPath, 'utf8'));
     const cookies = Array.isArray(content.cookies) ? content.cookies : [];
+    const sessionReadiness = validateStoredSessionState(content);
     const sanitizedCookies = cookies.map((c) => ({
       name: c.name,
       domain: c.domain,
@@ -33,6 +34,7 @@ export function getSessionStatus(targetPath = sessionPath) {
       updatedAt: stat.mtime.toISOString(),
       cookieCount: cookies.length,
       cookies: sanitizedCookies,
+      storedCookiesReady: sessionReadiness.ready,
     };
   } catch (err) {
     return { exists: true, path: targetPath, error: err.message };
@@ -95,6 +97,9 @@ export function convertCookiesToStorageState(input) {
 export function importSessionFile(sourcePath, targetPath = sessionPath) {
   const raw = JSON.parse(readFileSync(sourcePath, 'utf8'));
   const storageState = convertCookiesToStorageState(raw);
+  if (!validateStoredSessionState(storageState).ready) {
+    throw new Error('Imported session is missing nonempty Minnesota terms and session cookies; no session file was saved');
+  }
   const dir = path.dirname(targetPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 

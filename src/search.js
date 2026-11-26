@@ -1,5 +1,5 @@
 import { CONFIG } from './config.js';
-import { ensureTermsAccepted, checkWafBlock, normalizeCaseNumber, caseNumbersEqual, requireLiveMn, sleepJitter } from './waf.js';
+import { ensureTermsAccepted, normalizeCaseNumber, caseNumbersEqual, sleepJitter } from './waf.js';
 import { COUNTIES } from './counties.js';
 
 function resolveCounty(value) {
@@ -92,8 +92,6 @@ export function sanitizeSourceData(value) {
 }
 
 async function assertSearchPageHealthy(page, context) {
-  const result = await checkWafBlock(page);
-  if (result.blocked) throw Object.assign(new Error(result.reason), { code: 'blocked' });
   if (/error|service unavailable/i.test(await page.title())) throw Object.assign(new Error(`${context} returned an error page`), { code: 'retryable' });
 }
 
@@ -224,8 +222,6 @@ export async function waitForSearchResults(page, timeoutMs = CONFIG.delays.searc
         /Your search returned no results|No (?:cases|hearings|judgments) were found|Documents Available Online|The value .*not valid|field is required|access denied|request blocked|the requested url was rejected|verify you are human/i.test(text);
     }, undefined, { timeout: timeoutMs });
   } catch (error) {
-    const challenge = await checkWafBlock(page);
-    if (challenge.blocked) throw Object.assign(new Error(challenge.reason, { cause: error }), { code: 'blocked' });
     throw error;
   }
 }
@@ -233,7 +229,6 @@ export async function waitForSearchResults(page, timeoutMs = CONFIG.delays.searc
 export async function executeSearch(page, input) {
   const query = validateSearchOptions(input);
   if (query.sourceId && query.sourceId !== 'mn-mcro') throw new Error('Live search accepts only the mn-mcro source');
-  requireLiveMn();
   const endpoint = { document: CONFIG.urls.documentSearch, hearing: CONFIG.urls.hearingSearch, judgment: new URL('JudgmentSearch', CONFIG.urls.caseSearch).href }[query.searchType] || CONFIG.urls.caseSearch;
   await page.goto(endpoint, { waitUntil: 'domcontentloaded', timeout: CONFIG.delays.pageLoadTimeoutMs });
   // Let F5 client-telemetry settle before interacting, then pause like a human

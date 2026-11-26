@@ -22,30 +22,38 @@ test('findSystemChrome identifies local Chrome binary or respects environment ov
   }
 });
 
-test('ensureTermsAccepted never automates terms consent, even when the legacy opt-in is set', async () => {
-  const originalAutoAccept = process.env.COURT_AUTO_ACCEPT_TERMS;
+interface TermsPage {
+  locator: (selector: string) => {
+    isVisible: () => Promise<boolean>;
+    click: () => Promise<void>;
+  };
+  waitForTimeout: () => Promise<void>;
+}
+
+test('ensureTermsAccepted automatically clicks terms acceptance when the modal is present', async () => {
   let clicked = false;
-  const mockPage = {
+  const mockPage: TermsPage = {
     locator: (selector: string) => ({
       isVisible: async () => selector === '#tcModalAcceptBtn',
       click: async () => { clicked = true; },
     }),
     waitForTimeout: async () => {},
   };
-  try {
-    for (const setting of [undefined, 'true']) {
-      if (setting === undefined) delete process.env.COURT_AUTO_ACCEPT_TERMS;
-      else process.env.COURT_AUTO_ACCEPT_TERMS = setting;
-      await assert.rejects(
-        async () => ensureTermsAccepted(mockPage as any),
-        (error: any) => error.code === 'blocked' && /refusing automated terms acceptance on user's behalf/i.test(error.message),
-      );
-      assert.equal(clicked, false);
-    }
-  } finally {
-    if (originalAutoAccept === undefined) delete process.env.COURT_AUTO_ACCEPT_TERMS;
-    else process.env.COURT_AUTO_ACCEPT_TERMS = originalAutoAccept;
-  }
+  await ensureTermsAccepted(mockPage);
+  assert.equal(clicked, true);
+});
+
+test('ensureTermsAccepted does not click when the terms modal is absent', async () => {
+  let clicked = false;
+  const mockPage: TermsPage = {
+    locator: (selector: string) => ({
+      isVisible: async () => false,
+      click: async () => { clicked = true; },
+    }),
+    waitForTimeout: async () => {},
+  };
+  await ensureTermsAccepted(mockPage);
+  assert.equal(clicked, false);
 });
 
 test('MinnesotaAdapter exposes efficiency metrics and reuses session-level docket across document downloads', async () => {

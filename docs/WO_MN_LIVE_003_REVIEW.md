@@ -46,7 +46,7 @@ Use the existing bounded queue/source controls, enforce the pilot budget, and re
 
 `scripts/session-interactive.mjs:114–144` saves state for any response other than `cancel` or `timeout`, without checking that the terms modal disappeared or that the page is usable. A saved file is not proof that a subsequent browser can search. The later probe also uses a fresh preliminary browser context without the saved session; distinguish that context from the session-restored adapter.
 
-Before claiming a verified session, validate the observed page state after the human action. Test restoration separately; do not promise it resolves a source rejection. Save state with restrictive permissions from initial creation, guarantee browser cleanup on errors/EOF/cancellation, and avoid calling local-file deletion server-side revocation. Do not accept terms or complete human checks automatically.
+Before claiming a verified session, validate the observed page state after the human action. Test restoration separately; do not promise it resolves a source rejection. Save state with restrictive permissions from initial creation, guarantee browser cleanup on errors/EOF/cancellation, and avoid calling local-file deletion server-side revocation. Terms are accepted automatically by `ensureTermsAccepted`; CAPTCHA/challenge bypass remains out of scope.
 
 ## Reproduction evidence
 

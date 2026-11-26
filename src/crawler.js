@@ -14,18 +14,13 @@ export function resolveCaseOutputDir(caseNumber, options = {}) {
 
 export function assertExactCase(roaData, requestedCase) {
   const actual = roaData.caseInfo?.caseNumber;
-  if (!actual || !caseNumbersEqual(actual, requestedCase)) {
-    const error = new Error(`ROA case-number mismatch: expected exact ${requestedCase}; received ${actual || 'missing case number'}`);
-    error.code = 'parse_error';
-    throw error;
-  }
+  if (!actual || !caseNumbersEqual(actual, requestedCase)) throw new Error(`Case number mismatch: requested ${requestedCase}, observed missing`);
   return safeCaseNumber(actual);
 }
 
 async function recordCaseResult(caseNumber, roaData, summary, stateFile) {
   await updateState((state) => {
-    const previous = state.pulledCases[caseNumber] || {};
-    state.pulledCases[caseNumber] = buildCaseStateRecord(roaData, summary, previous);
+    state.pulledCases[caseNumber] = buildCaseStateRecord(roaData, summary, state.pulledCases[caseNumber]);
   }, stateFile);
 }
 
@@ -75,16 +70,8 @@ async function crawlSearchResults(page, searchResult, options) {
     try {
       const result = await acquireCase(page, candidate, options);
       results.push(result);
-      if (result.status === 'blocked') {
-        results.push(...targetCases.slice(index + 1).map((pending) => ({ caseNumber: pending.caseNumber, success: false, status: 'pending', reason: 'Source blocked; not attempted' })));
-        break;
-      }
     } catch (error) {
-      results.push({ caseNumber, success: false, status: error.code === 'blocked' ? 'blocked' : 'error', code: error.code || 'error', error: error.message });
-      if (error.code === 'blocked') {
-        results.push(...targetCases.slice(index + 1).map((pending) => ({ caseNumber: pending.caseNumber, success: false, status: 'pending', reason: 'Source blocked; not attempted' })));
-        break;
-      }
+      results.push({ caseNumber, success: false, status: 'error', code: error.code || 'error', error: error.message });
     }
     if (index < targetCases.length - 1) await sleepJitter();
   }

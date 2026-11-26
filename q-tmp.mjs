@@ -1,0 +1,10 @@
+import {Client} from "pg";
+const c=new Client({connectionString:process.env.COURT_DATABASE_URL});
+await c.connect();
+const cols=await c.query("SELECT column_name FROM information_schema.columns WHERE table_name='jobs' ORDER BY ordinal_position");
+console.log("job cols:", cols.rows.map(r=>r.column_name).join(","));
+const r=await c.query("SELECT id,type,status,attempts,available_at,lease_owner FROM jobs WHERE status NOT IN ('complete','cancelled') ORDER BY created_at DESC LIMIT 6");
+console.log(JSON.stringify(r.rows,null,1));
+const n=await c.query("SELECT now() as db_now");
+console.log("db now:", n.rows[0].db_now);
+process.exit(0);

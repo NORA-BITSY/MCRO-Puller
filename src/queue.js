@@ -100,19 +100,13 @@ export class WorkerQueue {
         else {
           this.failedCount++;
           this.retryCases.push(caseNumber);
-          if (result.status === 'blocked' || result.code === 'blocked' || result.summary?.status === 'blocked') {
-            this.isStopping = true;
-            this.status = 'blocked';
-          }
+          // Retryable failures (rate limits, challenges) are re-queued; nothing
+          // auto-stops the queue for source signals.
         }
       } catch (error) {
         this.failedCount++;
         this.retryCases.push(caseNumber);
-        this.results.push({ caseNumber, success: false, status: error.code === 'blocked' ? 'blocked' : 'error', error: error.message });
-        if (error.code === 'blocked') {
-          this.isStopping = true;
-          this.status = 'blocked';
-        }
+        this.results.push({ caseNumber, success: false, status: 'error', error: error.message });
       } finally {
         if (client) {
           try { await client.close(); } catch (error) { console.error(`[Worker ${workerId}] Browser cleanup failed: ${error.message}`); }

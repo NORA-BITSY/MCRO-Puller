@@ -40,23 +40,17 @@ export function generatePartitions(options = {}) {
 
   for (const cty of targetCounties) {
     for (const cat of targetCategories) {
-      partitions.push({
-        county: cty,
-        category: cat,
-        filedDateFrom: dateFrom,
-        filedDateTo: dateTo,
-        caseStatus: status,
-        query: options.query,
-      });
+      partitions.push({ county: cty, category: cat, dateFrom, dateTo, status });
     }
   }
 
   return partitions;
 }
+
 function parseDate(value) {
   if (!value) return null;
-  const date = new Date(`${value}T00:00:00Z`);
-  return Number.isNaN(date.getTime()) ? null : date;
+  const d = new Date(value);
+  return Number.isFinite(d.getTime()) ? d : null;
 }
 
 function formatDate(date) {
@@ -64,42 +58,16 @@ function formatDate(date) {
 }
 
 export async function discoverPartition(page, partition, maxCasesPerSlice = 200, search = executeSearch) {
-  const criterion = validateDiscoveryQuery(partition.query);
-  const query = validateSearchOptions({
-    ...criterion,
-    counties: [partition.county],
-    categories: [partition.category],
-    status: partition.caseStatus,
-    ...(partition.filedDateFrom ? { filedFrom: partition.filedDateFrom } : {}),
-    ...(partition.filedDateTo ? { filedTo: partition.filedDateTo } : {}),
+  const { county, category, dateFrom, dateTo } = partition;
+  return search(page, {
+    searchType: 'party',
+    county,
+    categories: [category],
+    filedFrom: dateFrom || undefined,
+    filedTo: dateTo || undefined,
+    pageSize: maxCasesPerSlice,
   });
-  const result = await search(page, query);
-
-  if (!result.truncated && result.cases.length < maxCasesPerSlice) return result.cases;
-
-  const start = parseDate(partition.filedDateFrom);
-  const end = parseDate(partition.filedDateTo);
-  if (!start || !end || start >= end) {
-    throw new Error(
-      `Partition remains capped at ${result.cases.length} results and cannot be split further: ` +
-      `${partition.county}/${partition.category}/${partition.filedDateFrom || 'open'}-${partition.filedDateTo || 'open'}`
-    );
-  }
-
-  const midpoint = new Date(start.getTime() + Math.floor((end.getTime() - start.getTime()) / 2));
-  const rightStart = new Date(midpoint.getTime() + 24 * 60 * 60 * 1000);
-  const left = await discoverPartition(page, {
-    ...partition,
-    filedDateTo: formatDate(midpoint),
-  }, maxCasesPerSlice, search);
-  const right = await discoverPartition(page, {
-    ...partition,
-    filedDateFrom: formatDate(rightStart),
-  }, maxCasesPerSlice, search);
-
-  return [...new Map([...left, ...right].map((item) => [item.caseNumber, item])).values()];
 }
-
 
 /**
  * County-partitioned discovery for one validated source query.
@@ -123,7 +91,7 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
   for (let pIdx = 0; pIdx < partitions.length; pIdx++) {
     const part = partitions[pIdx];
     console.log(
-      `\n>>> [Partition ${pIdx + 1}/${partitions.length}] County: ${part.county} | Cat: ${part.category} | Status: ${part.caseStatus}`
+      `\n>>> [Partition ${pIdx + 1}/${partitions.length}] County: ${part.county} | Cat: ${part.category} | Status: ${part.status}`
     );
 
     let cases;
@@ -132,7 +100,6 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
     } catch (err) {
       console.error(`  [Partition Error] Failed to search partition: ${err.message}`);
       partitionFailures.push({ partition: part, error: err.message });
-      if (['blocked', 'unsupported', 'permanent'].includes(err.code)) throw err;
       await sleepJitter();
       continue;
     }
@@ -162,7 +129,6 @@ export async function crawlStatewideActiveCases(browserClient, options = {}) {
       } catch (err) {
         console.error(`  [Case Error] Failed pulling ${caseNo}: ${err.message}`);
         caseFailures.push({ caseNumber: caseNo, error: err.message });
-        if (err.code === 'blocked') throw err;
       }
 
       // Jitter pause between cases
